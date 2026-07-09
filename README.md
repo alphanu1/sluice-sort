@@ -46,8 +46,6 @@ Reproduce with `make bench`.
 
 ### Across the full size range vs multiple methods
 
-![Sluice speedup vs std::sort, std::stable_sort, and heapsort across n](docs/benchmark.svg)
-
 Sweeping n from 8 to 1,048,576 (uniform random uint32), Sluice's advantage
 grows from parity at the smallest sizes to 7–12× at a million elements. The
 **overall geometric-mean gain is 4.7× across the field** (3.7× vs `std::sort`,
