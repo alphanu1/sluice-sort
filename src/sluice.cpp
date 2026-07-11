@@ -84,29 +84,14 @@ void insertion(U* a, size_t n) {
 //
 // Key precision loss for wide U only affects placement; the insertion pass
 // repairs any local disorder, so a successful result is always correct.
-// Exact bucket index = (off * (n-1)) / range, with off in [0, range] and
-// range >= 1, so the result is always in [0, n-1]. Uses 128-bit integers where
-// available (all mainstream 64-bit GCC/Clang, incl. AArch64 and MinGW); for
-// <=32-bit keys uint64 already suffices. The only fallback that touches
-// floating point is 64-bit keys on a platform without 128-bit ints — and even
-// then `range` was formed by integer subtraction so it is >= 1, meaning
-// (double)range >= 1 and there is NO division by zero. The bucket is only an
-// estimate anyway; interp_small's repair pass and skew guard keep results
-// correct regardless of rounding.
-template <class U>
-inline int interp_bucket(U off, unsigned nm1, U range) {
-#if defined(__SIZEOF_INT128__)
-    return static_cast<int>((static_cast<unsigned __int128>(off) * nm1) / range);
-#else
-    if (sizeof(U) <= sizeof(uint32_t))
-        return static_cast<int>((static_cast<uint64_t>(off) * nm1) / range);
-    double k = static_cast<double>(off) * static_cast<double>(nm1)
-             / static_cast<double>(range);
-    int ki = static_cast<int>(k);
-    return ki < 0 ? 0 : (ki > static_cast<int>(nm1) ? static_cast<int>(nm1) : ki);
-#endif
-}
-
+// Bucket index = off * (n-1) / range. `range` is formed by INTEGER subtraction
+// (mx - mn), so it is exactly >= 1 — hence (double)range >= 1 and there is no
+// floating-point division by zero, even for adjacent 64-bit magnitudes that
+// collide when cast to double (the bug the integer range guards against). We
+// compute scale = (n-1) / range ONCE and multiply per element — a cheap FP
+// multiply, not a per-element integer division (which measurably slowed this hot
+// path). The bucket is only an estimate; the insertion repair pass and skew
+// guard keep the result correct regardless of float rounding.
 template <class U>
 bool interp_small(U* a, int n, int skew) {
     if (n < 2) return true;
@@ -115,10 +100,11 @@ bool interp_small(U* a, int n, int skew) {
     if (mn == mx) return true;
     const U range = static_cast<U>(mx - mn);         // exact integer diff, >= 1
     const unsigned nm1 = static_cast<unsigned>(n - 1);
+    const double scale = static_cast<double>(nm1) / static_cast<double>(range);
 
-    // Scratch stays on the stack for the default band (n <= INTERP_MAX); a
-    // config that raises interpolation_max up to INTERP_CAP spills to the heap
-    // (and bails to radix if that allocation fails). The fast path is unchanged.
+    // Scratch stays on the stack for the default band (n <= INTERP_MAX); a config
+    // that raises interpolation_max up to INTERP_CAP spills to the heap (bailing
+    // to radix on allocation failure). The fast path is unchanged.
     uint16_t key_s[INTERP_MAX]; int cnt_s[INTERP_MAX + 1]; U out_s[INTERP_MAX];
     std::vector<uint16_t> key_h; std::vector<int> cnt_h; std::vector<U> out_h;
     uint16_t* key = key_s; int* cnt = cnt_s; U* out = out_s;
@@ -132,7 +118,8 @@ bool interp_small(U* a, int n, int skew) {
     for (int i = 0; i < n; ++i) cnt[i] = 0;
     int maxbucket = 0;
     for (int i = 0; i < n; ++i) {
-        int k = interp_bucket<U>(static_cast<U>(a[i] - mn), nm1, range);  // in [0, n-1]
+        int k = static_cast<int>(static_cast<double>(static_cast<U>(a[i] - mn)) * scale);
+        if (k >= n) k = n - 1;                 // guard float round-up
         key[i] = static_cast<uint16_t>(k);
         int c = ++cnt[k];
         if (c > maxbucket) maxbucket = c;
@@ -602,6 +589,6 @@ SLUICE_API int sluice_is_sorted_u32(const uint32_t* data, size_t n) {
     return 1;
 }
 
-SLUICE_API const char* sluice_version(void) { return "sluice 0.4.0"; }
+SLUICE_API const char* sluice_version(void) { return "sluice 0.4.1"; }
 
 }  // extern "C"

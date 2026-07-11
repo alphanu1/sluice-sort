@@ -3,7 +3,7 @@
 **An adaptive numeric sorting engine that routes every dataset through its
 fastest available sorting strategy.**
 
-*Version 0.4.0*
+*Version 0.4.1*
 
 Just as a sluice channels a mixed stream and separates it into graded outputs by
 routing it through the right screen, this engine inspects the input and

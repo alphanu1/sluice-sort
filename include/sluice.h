@@ -165,7 +165,7 @@ SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
  * Provided because "is it already sorted?" is a cheap, common query. */
 SLUICE_API int  sluice_is_sorted_u32(const uint32_t* data, size_t n);
 
-/* Library version, e.g. "sluice 0.4.0". */
+/* Library version, e.g. "sluice 0.4.1". */
 SLUICE_API const char* sluice_version(void);
 
 #ifdef __cplusplus
