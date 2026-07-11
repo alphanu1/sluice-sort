@@ -113,14 +113,16 @@ typedef enum {
 
 /* Return status. */
 typedef enum {
-    SLUICE_OK       =  0,
-    SLUICE_ERR_TYPE = -1,   /* unsupported dtype */
-    SLUICE_ERR_NULL = -2    /* NULL data with n>0, or stats requested but NULL */
+    SLUICE_OK         =  0,
+    SLUICE_ERR_TYPE   = -1,   /* unsupported dtype */
+    SLUICE_ERR_NULL   = -2,   /* NULL data with n>0, or stats requested but NULL */
+    SLUICE_ERR_CONFIG = -3    /* sluice_config contained an invalid value */
 } sluice_status;
 
 /* Profiling info, filled when collect_stats is nonzero. */
 typedef struct {
-    const char* algorithm;      /* "insertion"|"interpolation"|"counting"|"radix"|"already sorted"|"std::sort" */
+    const char* algorithm;      /* "insertion"|"interpolation"|"counting"|"low-cardinality"|
+                                 * "radix"|"already sorted"|"reverse"|"std::sort" */
     double      time_ms;        /* wall time of the sort */
     size_t      memory_bytes;   /* auxiliary heap the chosen path used */
     int         passes;         /* radix passes (0 for other paths) */
@@ -139,12 +141,16 @@ typedef struct {
 typedef struct {
     size_t   insertion_limit;      /* n < this -> insertion sort   (default 16)      */
     size_t   interpolation_limit;  /* n <= this -> interpolation   (default 512)     */
-    int      interpolation_skew;   /* interp bucket-skew bail      (default 32)      */
+    int      interpolation_skew;   /* interp bucket-skew bail; must be >= 0 (default 32) */
     uint64_t counting_load;        /* counting if range <= load*n  (default 4)       */
     uint64_t counting_cap;         /* ...and range < cap           (default 2097152) */
-    int      max_threads;          /* parallel radix on large n; 0/1 = sequential    */
+    int      max_threads;          /* parallel radix on large n; must be >= 0; 0/1 = sequential */
     size_t   parallel_min;         /* only parallelize when n >= this (default 262144)*/
 } sluice_config;
+/* Validity (checked by sluice_sort): every field left 0 uses its default and is
+ * always valid. When non-zero, insertion_limit must not exceed interpolation_limit
+ * (after each resolves its default), interpolation_skew must be >= 0, and
+ * max_threads must be >= 0. Anything else yields SLUICE_ERR_CONFIG. */
 
 /* Fill cfg with the default thresholds. */
 SLUICE_API void sluice_config_init(sluice_config* cfg);
@@ -154,8 +160,11 @@ SLUICE_API void sluice_config_init(sluice_config* cfg);
  * `order` may be NULL for ascending. When `collect_stats` is nonzero, `stats`
  * (must be non-NULL) is filled with profiling info at some cost. `cfg` may be
  * NULL for default thresholds; when non-NULL, custom tuning is applied (this
- * routes through the general engine rather than the in-place specialized path).
- * Returns SLUICE_OK, SLUICE_ERR_TYPE, or SLUICE_ERR_NULL. */
+ * routes through the general engine rather than the in-place specialized path)
+ * after being validated — an out-of-range field yields SLUICE_ERR_CONFIG and no
+ * work is done. A field left 0 is treated as "use the default" and is always
+ * valid. Returns SLUICE_OK, SLUICE_ERR_TYPE, SLUICE_ERR_NULL, or
+ * SLUICE_ERR_CONFIG. */
 SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
                                      ptrdiff_t select, const sluice_order* order,
                                      int collect_stats, sluice_stats* stats,

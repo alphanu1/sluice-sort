@@ -207,14 +207,14 @@ void radix_lower(U* a, size_t n) {
 // sequential radix. Returns the number of worker threads used, or 0 on OOM
 // (caller then falls back to sequential radix).
 template <class U>
-int parallel_radix(U* a, size_t n, int want_threads) {
+int parallel_radix(U* a, size_t n, int want_threads, size_t* aux_peak = nullptr) {
     constexpr int TOPSHIFT = (static_cast<int>(sizeof(U)) - 1) * 8;
     std::vector<U> buf;
     try { buf.resize(n); } catch (const std::bad_alloc&) { return 0; }
 
     size_t off[257];
+    size_t hist[256] = {0};
     {
-        size_t hist[256] = {0};
         for (size_t i = 0; i < n; ++i) ++hist[(static_cast<uint64_t>(a[i]) >> TOPSHIFT) & 0xFFu];
         size_t sum = 0;
         for (int b = 0; b < 256; ++b) { off[b] = sum; sum += hist[b]; }
@@ -232,6 +232,22 @@ int parallel_radix(U* a, size_t n, int want_threads) {
     int nthreads = want_threads;
     if (nthreads > 256) nthreads = 256;
     if (nthreads < 1)   nthreads = 1;
+
+    // Peak auxiliary heap (excluding the caller's key buffer): the partition
+    // target `buf` (n elements, always live) plus the worker radix_lower buffers.
+    // At most `nthreads` workers run at once, so the concurrent worker buffers
+    // never exceed the sum of the `nthreads` largest buckets — a tight, data-
+    // driven, scheduling-independent bound. Buckets of size 1 skip radix_lower.
+    if (aux_peak) {
+        size_t sizes[256];
+        for (int b = 0; b < 256; ++b) sizes[b] = hist[b] > 1 ? hist[b] : 0;
+        int topk = nthreads < 256 ? nthreads : 256;
+        std::partial_sort(sizes, sizes + topk, sizes + 256,
+                          [](size_t x, size_t y) { return x > y; });
+        size_t worker_elems = 0;
+        for (int i = 0; i < topk; ++i) worker_elems += sizes[i];
+        *aux_peak = (n + worker_elems) * sizeof(U);
+    }
 
     std::atomic<int> next_bucket{0};
     auto worker = [&]() {
@@ -252,48 +268,130 @@ int parallel_radix(U* a, size_t n, int want_threads) {
     return nthreads;
 }
 
+// --- low-cardinality sort (few distinct values, any value range) --------
+// When an input has only a handful of distinct values spread across a range too
+// wide for counting sort, neither counting (O(range)) nor radix (full byte
+// passes + ~n heap) is ideal. Tallying the distinct set directly is O(n log m)
+// with m tiny and needs no heap. This catches enum/categorical data.
+constexpr int LOWCARD_MAX = 16;    // treat <= this many distinct values as low-card
+
+// Sort `a` in place given its `m` distinct values (unsorted) in `vals`
+// (m <= LOWCARD_MAX). Orders the tiny distinct set, tallies each value's count,
+// then emits ascending. Stack-only — no allocation, so it cannot fail.
+template <class U>
+void low_cardinality(U* a, size_t n, U* vals, int m) {
+    insertion(vals, static_cast<size_t>(m));           // order the tiny distinct set
+    size_t cnt[LOWCARD_MAX] = {0};
+    for (size_t i = 0; i < n; ++i) {
+        U x = a[i];
+        int lo = 0, hi = m - 1, idx = 0;               // binary search in vals
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            if (vals[mid] == x) { idx = mid; break; }
+            if (vals[mid] < x)  lo = mid + 1; else hi = mid - 1;
+        }
+        ++cnt[idx];
+    }
+    size_t o = 0;
+    for (int d = 0; d < m; ++d) { U v = vals[d]; for (size_t c = cnt[d]; c > 0; --c) a[o++] = v; }
+}
+
 // --- the dispatcher -----------------------------------------------------
 // Optional out-parameter: when non-null, records which path actually ran, how
-// many radix passes, and how many threads. Left null on the fast path.
-struct core_path { const char* algorithm; int passes; int threads; };
+// many radix passes, threads, and the auxiliary heap that path allocated (bytes,
+// excluding the caller's key buffer). Left null on the fast path.
+struct core_path { const char* algorithm; int passes; int threads; size_t aux_bytes; };
 
 template <class U>
 void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th = Thresholds{}) {
-    auto note = [&](const char* alg, int passes, int threads) { if (path) { path->algorithm = alg; path->passes = passes; path->threads = threads; } };
-    note("insertion", 0, 1);
+    auto note = [&](const char* alg, int passes, int threads, size_t aux) {
+        if (path) { path->algorithm = alg; path->passes = passes; path->threads = threads; path->aux_bytes = aux; } };
+    note("insertion", 0, 1, 0);
     if (n < 2) return;
     if (n < th.insertion_max) { insertion(a, n); return; }
     // small arrays: the interpolation placement sort wins here. If it detects
     // skew it returns false and we fall through to radix (n is small, so the
     // radix allocation is tiny).
-    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew)) { note("interpolation", 0, 1); return; }
-
-    // one scan: min, max, and "already sorted?" — cheap, high-value.
-    U mn = a[0], mx = a[0];
-    bool sorted = true;
-    for (size_t i = 1; i < n; ++i) {
-        U x = a[i];
-        if (x < a[i - 1]) sorted = false;
-        if (x < mn) mn = x;
-        else if (x > mx) mx = x;
+    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew)) {
+        // The interp path is stack-only in the default band; a raised interp_max
+        // spills scratch to the heap for n > INTERP_MAX (key_h + cnt_h + out_h).
+        size_t interp_aux = (n > INTERP_MAX)
+            ? n * sizeof(uint16_t) + (n + 1) * sizeof(int) + n * sizeof(U) : 0;
+        note("interpolation", 0, 1, interp_aux); return;
     }
-    if (sorted) { note("already sorted", 0, 1); return; }
+
+    // one scan: min, max, and run detection in BOTH directions — cheap and
+    // high-value. An array already ordered ascending returns in O(n); one
+    // ordered descending is finished by a single O(n) reverse instead of a full
+    // radix sort (equal integers are indistinguishable, so reversing a
+    // non-increasing run yields the correct non-decreasing order).
+    //
+    // The scan runs in blocks so run-detection never adds a per-element branch to
+    // the hot loop (which would mispredict ~50% of the time on random data). Flags
+    // are updated BRANCHLESSLY (&= of a comparison). We drop each direction the
+    // moment it is ruled out — checked only at block boundaries — so the common
+    // cases collapse to the original scan's cost:
+    //   * unsorted random: both directions die in block 1, then pure min/max
+    //   * already ascending: `descending` dies in block 1, leaving a 1-comparison
+    //                        ascending scan (identical to the original) over the rest
+    //   * fully descending: stays in the two-flag loop, is detected, and O(n)-reversed
+    constexpr size_t BLK = 256;
+    U mn = a[0], mx = a[0];
+    bool ascending = true, descending = true;
+    size_t i = 1;
+    while (i < n && descending) {              // phase 1: both directions still open
+        size_t end = i + BLK < n ? i + BLK : n;
+        for (; i < end; ++i) {
+            U x = a[i], prev = a[i - 1];
+            ascending  &= (x >= prev);
+            descending &= (x <= prev);
+            if (x < mn) mn = x; else if (x > mx) mx = x;
+        }
+    }
+    // Once `descending` is ruled out (block 1 for anything not reverse-sorted) this
+    // is exactly the original scan: one branchless ascending check plus min/max.
+    for (; i < n; ++i) {
+        U x = a[i], prev = a[i - 1];
+        ascending &= (x >= prev);
+        if (x < mn) mn = x; else if (x > mx) mx = x;
+    }
+    if (ascending)  { note("already sorted", 0, 1, 0); return; }
+    if (descending) { std::reverse(a, a + n); note("reverse", 0, 1, 0); return; }
 
     const uint64_t range = static_cast<uint64_t>(mx) - static_cast<uint64_t>(mn);
 
-    // bounded range -> counting sort (pure O(n), no comparisons)
+    // bounded range -> counting sort (pure O(n), no comparisons). Fastest for
+    // small ranges, so it takes precedence over the low-cardinality path.
     if (range < th.counting_cap && range <= th.counting_load * static_cast<uint64_t>(n)) {
-        try { counting(a, n, mn, range); note("counting", 0, 1); return; }
+        try { counting(a, n, mn, range);
+              note("counting", 0, 1, (static_cast<size_t>(range) + 1) * sizeof(size_t)); return; }
         catch (const std::bad_alloc&) { /* fall through */ }
+    }
+
+    // wide range but few distinct values -> tally the distinct set directly.
+    // Bounded probe: bails the moment a (LOWCARD_MAX+1)th distinct value appears,
+    // so high-cardinality inputs (the radix case) pay only a short prefix scan.
+    {
+        U vals[LOWCARD_MAX]; int m = 0; bool low = true;
+        for (size_t i = 0; i < n; ++i) {
+            U x = a[i]; bool seen = false;
+            for (int d = 0; d < m; ++d) if (vals[d] == x) { seen = true; break; }
+            if (!seen) {
+                if (m < LOWCARD_MAX) vals[m++] = x;
+                else { low = false; break; }
+            }
+        }
+        if (low) { low_cardinality(a, n, vals, m); note("low-cardinality", 0, 1, 0); return; }
     }
     // general integers -> radix; parallel MSD radix when configured and large.
     try {
         if (th.max_threads > 1 && n >= th.parallel_min) {
-            int used = parallel_radix(a, n, th.max_threads);
-            if (used > 0) { note("radix", static_cast<int>(sizeof(U)), used); return; }
+            size_t paux = 0;
+            int used = parallel_radix(a, n, th.max_threads, &paux);
+            if (used > 0) { note("radix", static_cast<int>(sizeof(U)), used, paux); return; }
         }
-        radix(a, n); note("radix", static_cast<int>(sizeof(U)), 1); return;
-    } catch (const std::bad_alloc&) { std::sort(a, a + n); note("std::sort", 0, 1); }
+        radix(a, n); note("radix", static_cast<int>(sizeof(U)), 1, n * sizeof(U)); return;
+    } catch (const std::bad_alloc&) { std::sort(a, a + n); note("std::sort", 0, 1, 0); }
 }
 
 // map signed <-> unsigned preserving order by flipping the sign bit
@@ -301,6 +399,14 @@ template <class U>
 void flip_sign_bit(U* u, size_t n) {
     const U mask = static_cast<U>(U(1) << (sizeof(U) * 8 - 1));
     for (size_t i = 0; i < n; ++i) u[i] ^= mask;
+}
+
+// |select| for a negative select, computed without overflow. Negating a
+// ptrdiff_t of PTRDIFF_MIN is undefined (no positive counterpart in the signed
+// type), so we negate in the unsigned domain, where wraparound is well-defined
+// and yields exactly the magnitude. Caller guarantees s < 0.
+inline size_t neg_magnitude(ptrdiff_t s) {
+    return static_cast<size_t>(0) - static_cast<size_t>(s);
 }
 
 // move the last kk = min(k, n) elements to the front; returns kk
@@ -340,18 +446,32 @@ sluice_status run(T* data, size_t n, ptrdiff_t select, sluice_order order,
               st->passes = 0; st->already_sorted = 1; st->duplicate_pct = 0.0;
               st->range = 0.0; st->n = n; st->threads_used = 1; }
     auto apply_select = [&]() {
-        if (select < 0) { size_t k = static_cast<size_t>(-select); if (k > n) k = n;
+        if (select < 0) { size_t k = neg_magnitude(select); if (k > n) k = n;
             if (k && k < n) std::memmove(data, data + (n - k), k * sizeof(T)); }
     };
     if (n < 2) return SLUICE_OK;
 
+    // Clock spans the whole end-to-end operation (key transform, core sort,
+    // direction, back-transform, selection) when profiling — not just the core.
+    using clk = std::chrono::steady_clock;
+    clk::time_point t0;
+    if (st) t0 = clk::now();
+
     std::vector<KeyT> keys;
     try { keys.resize(n); }
     catch (const std::bad_alloc&) {
-        std::sort(data, data + n);
+        // No room for the key buffer. Sort in place by the order-preserving key
+        // via a comparator — correct for every domain, including float NaNs
+        // (a raw std::sort over floats is UB when NaNs are present, so we must
+        // not fall back to it). No auxiliary heap is used here.
+        std::sort(data, data + n, [dom](const T& x, const T& y) {
+            KeyT kx, ky; std::memcpy(&kx, &x, sizeof kx); std::memcpy(&ky, &y, sizeof ky);
+            return to_key(kx, dom) < to_key(ky, dom);
+        });
         if (order == SLUICE_DESCENDING) std::reverse(data, data + n);
-        if (st) st->algorithm = "std::sort";
         apply_select();
+        if (st) { st->algorithm = "std::sort"; st->memory_bytes = 0;
+                  st->time_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count(); }
         return SLUICE_OK;
     }
 
@@ -363,32 +483,30 @@ sluice_status run(T* data, size_t n, ptrdiff_t select, sluice_order order,
         if (st) { if (k < keys[i - 1]) sorted = false; if (k < mn) mn = k; else if (k > mx) mx = k; }
     }
 
-    core_path path{ "insertion", 0, 1 };
-    if (st) {
-        st->already_sorted = sorted ? 1 : 0;
-        st->range = static_cast<double>(mx) - static_cast<double>(mn);
-        auto t0 = std::chrono::steady_clock::now();
-        sluice_core(keys.data(), n, &path, th);
-        auto t1 = std::chrono::steady_clock::now();
-        st->time_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        st->algorithm = path.algorithm;
-        st->passes    = path.passes;
-        st->threads_used = path.threads;
-        size_t distinct = 1;
-        for (size_t i = 1; i < n; ++i) if (keys[i] != keys[i - 1]) ++distinct;
-        st->duplicate_pct = 100.0 * (1.0 - static_cast<double>(distinct) / static_cast<double>(n));
-        size_t mem = 0;
-        if (std::strcmp(path.algorithm, "radix") == 0)         mem = n * sizeof(KeyT);
-        else if (std::strcmp(path.algorithm, "counting") == 0) mem = (static_cast<size_t>(st->range) + 1) * sizeof(size_t);
-        if (dom == Domain::Float) mem += n * sizeof(KeyT);
-        st->memory_bytes = mem;
-    } else {
-        sluice_core(keys.data(), n, nullptr, th);
-    }
+    core_path path{ "insertion", 0, 1, 0 };
+    sluice_core(keys.data(), n, st ? &path : nullptr, th);
 
     if (order == SLUICE_DESCENDING) std::reverse(keys.begin(), keys.end());
     for (size_t i = 0; i < n; ++i) { KeyT b = from_key(keys[i], dom); std::memcpy(&data[i], &b, sizeof b); }
     apply_select();
+
+    if (st) {
+        st->time_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        st->already_sorted = sorted ? 1 : 0;
+        st->range        = static_cast<double>(mx) - static_cast<double>(mn);
+        st->algorithm    = path.algorithm;
+        st->passes       = path.passes;
+        st->threads_used = path.threads;
+        // duplicate_pct is profiling-only work, so it stays outside the timer.
+        size_t distinct = 1;
+        for (size_t i = 1; i < n; ++i) if (keys[i] != keys[i - 1]) ++distinct;
+        st->duplicate_pct = 100.0 * (1.0 - static_cast<double>(distinct) / static_cast<double>(n));
+        // Peak auxiliary heap. The key-transform buffer (keys[]) is ALWAYS
+        // allocated once we reach here, so it is always counted; the chosen core
+        // path reports its own working buffer (radix ping-pong, counting tally,
+        // parallel worker buffers, interp heap spill) via path.aux_bytes.
+        st->memory_bytes = n * sizeof(KeyT) + path.aux_bytes;
+    }
     return SLUICE_OK;
 }
 
@@ -446,7 +564,14 @@ SLUICE_API void sluice_sort_f32_ordered(float* data, size_t n, sluice_order orde
         if (order == SLUICE_DESCENDING) std::reverse(keys.begin(), keys.end());
         for (size_t i = 0; i < n; ++i) { uint32_t b = funkey32(keys[i]); std::memcpy(&data[i], &b, sizeof b); }
     } catch (const std::bad_alloc&) {
-        std::sort(data, data + n);
+        // No room for the key buffer. Sort in place by the SAME order-preserving
+        // key via a comparator so NaNs keep their total order — a raw std::sort
+        // over floats is undefined when NaNs are present (NaN compares false both
+        // ways, violating strict-weak-ordering).
+        std::sort(data, data + n, [](float x, float y) {
+            uint32_t bx, by; std::memcpy(&bx, &x, sizeof bx); std::memcpy(&by, &y, sizeof by);
+            return fkey32(bx) < fkey32(by);
+        });
         if (order == SLUICE_DESCENDING) std::reverse(data, data + n);
     }
 }
@@ -459,7 +584,12 @@ SLUICE_API void sluice_sort_f64_ordered(double* data, size_t n, sluice_order ord
         if (order == SLUICE_DESCENDING) std::reverse(keys.begin(), keys.end());
         for (size_t i = 0; i < n; ++i) { uint64_t b = funkey64(keys[i]); std::memcpy(&data[i], &b, sizeof b); }
     } catch (const std::bad_alloc&) {
-        std::sort(data, data + n);
+        // See the f32 note: sort by the order-preserving key so NaNs keep a
+        // consistent total order rather than triggering std::sort's NaN UB.
+        std::sort(data, data + n, [](double x, double y) {
+            uint64_t bx, by; std::memcpy(&bx, &x, sizeof bx); std::memcpy(&by, &y, sizeof by);
+            return fkey64(bx) < fkey64(by);
+        });
         if (order == SLUICE_DESCENDING) std::reverse(data, data + n);
     }
 }
@@ -520,8 +650,8 @@ SLUICE_API size_t sluice_top_n_f64(double* data, size_t n, size_t k, sluice_orde
 #define SLUICE_FAST(SUF, T)                                                     \
     do {                                                                        \
         T* p = static_cast<T*>(data);                                           \
-        if (select > 0)      sluice_first_n_##SUF(p, n, static_cast<size_t>(select),  ord); \
-        else if (select < 0) sluice_top_n_##SUF(p, n, static_cast<size_t>(-select), ord); \
+        if (select > 0)      sluice_first_n_##SUF(p, n, static_cast<size_t>(select), ord); \
+        else if (select < 0) sluice_top_n_##SUF(p, n, neg_magnitude(select), ord); \
         else                 sluice_sort_##SUF##_ordered(p, n, ord);            \
     } while (0)
 
@@ -537,6 +667,28 @@ SLUICE_API void sluice_config_init(sluice_config* cfg) {
     cfg->parallel_min        = d.parallel_min;
 }
 
+// Validate a user config before it is trusted. Every field left 0 means "use
+// the compiled-in default" and is always valid. A non-zero field is rejected
+// only when it would produce nonsensical or unsafe dispatch: a negative skew
+// (the interp guard would always bail), a negative thread count, or a resolved
+// insertion_limit above the resolved interpolation_limit (which would invert the
+// dispatch order and run insertion sort, O(n^2), on arrays past the interp band).
+// Both limits resolve their default and the internal ceiling first, so the
+// comparison matches exactly what the engine would use.
+static bool config_valid(const sluice_config* cfg) {
+    if (!cfg) return true;
+    if (cfg->interpolation_skew < 0) return false;
+    if (cfg->max_threads < 0)        return false;
+    size_t ins = cfg->insertion_limit
+               ? (cfg->insertion_limit     < INTERP_CAP ? cfg->insertion_limit     : INTERP_CAP)
+               : INSERTION_MAX;
+    size_t itp = cfg->interpolation_limit
+               ? (cfg->interpolation_limit < INTERP_CAP ? cfg->interpolation_limit : INTERP_CAP)
+               : INTERP_MAX;
+    if (ins > itp) return false;
+    return true;
+}
+
 SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
                                      ptrdiff_t select, const sluice_order* order,
                                      int collect_stats, sluice_stats* stats,
@@ -544,6 +696,7 @@ SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
     const sluice_order ord = order ? *order : SLUICE_ASCENDING;
     if (data == nullptr && n > 0) return SLUICE_ERR_NULL;
     if (collect_stats && stats == nullptr) return SLUICE_ERR_NULL;
+    if (!config_valid(cfg)) return SLUICE_ERR_CONFIG;
 
     // Fast path: default thresholds and no stats -> in-place specialized funcs.
     if (!collect_stats && cfg == nullptr) {
