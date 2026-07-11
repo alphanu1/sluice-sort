@@ -111,6 +111,63 @@ static bool self_test() {
             std::printf("  top_n FAIL n=%zu k=%zu\n", n, k); return false;
         }
     }
+
+    // --- fixed boundary sizes straddling every dispatch threshold ---------
+    auto vs_gold_u64 = [](std::vector<uint64_t> v) {
+        std::vector<uint64_t> g(v); std::sort(g.begin(), g.end());
+        sluice_sort_u64(v.data(), v.size()); return v == g;
+    };
+    for (size_t n : {size_t(15), size_t(16), size_t(17), size_t(31), size_t(32),
+                     size_t(33), size_t(511), size_t(512), size_t(513),
+                     size_t(999), size_t(1000), size_t(1001),
+                     size_t(100000), size_t(1000000)}) {
+        std::mt19937_64 r64(n * 2654435761u);
+        // several distributions per size: full-range, bounded, dup-heavy,
+        // nearly-sorted, reverse-sorted, all-equal
+        for (int variant = 0; variant < 6; ++variant) {
+            std::vector<uint64_t> v(n);
+            for (size_t i = 0; i < n; ++i) {
+                switch (variant) {
+                    case 0: v[i] = r64(); break;                    // full range
+                    case 1: v[i] = r64() % 1000; break;             // bounded (counting)
+                    case 2: v[i] = r64() % 8; break;                // duplicate-heavy
+                    case 3: v[i] = i + (r64() % 4); break;          // nearly sorted
+                    case 4: v[i] = n - i; break;                    // reverse sorted
+                    default: v[i] = 42; break;                      // all equal
+                }
+            }
+            if (!vs_gold_u64(v)) { std::printf("  boundary FAIL n=%zu v=%d\n", n, variant); return false; }
+        }
+    }
+
+    // --- adversarial magnitudes: values where double() collides ----------
+    {
+        const uint64_t P63 = (1ull << 63), P53 = (1ull << 53), UMAX = ~0ull;
+        std::vector<std::vector<uint64_t>> adv = {
+            {P63, P63 + 1}, {P63 - 1, P63, P63 + 1, P63 + 1023},
+            {P53, P53 + 1, P53 + 2}, {UMAX, UMAX - 1, UMAX - 512},
+            {0, UMAX, P63, P53}, {0, 1, UMAX - 1, UMAX},
+        };
+        for (auto& base : adv)
+            for (int reps = 1; reps <= 128; reps *= 2) {
+                std::vector<uint64_t> v;
+                for (int r = 0; r < reps; ++r) v.insert(v.end(), base.begin(), base.end());
+                if (!vs_gold_u64(v)) { std::printf("  adversarial u64 FAIL sz=%zu\n", v.size()); return false; }
+            }
+    }
+
+    // --- signed extremes: negatives must order below positives -----------
+    {
+        std::vector<int64_t> ext = {INT64_MIN, INT64_MAX, 0, -1, 1,
+                                    INT64_MIN + 1, INT64_MAX - 1, INT64_MIN + 512};
+        for (int reps = 1; reps <= 128; reps *= 2) {
+            std::vector<int64_t> v;
+            for (int r = 0; r < reps; ++r) v.insert(v.end(), ext.begin(), ext.end());
+            std::vector<int64_t> g(v); std::sort(g.begin(), g.end());
+            sluice_sort_i64(v.data(), v.size());
+            if (v != g) { std::printf("  i64 extreme FAIL sz=%zu\n", v.size()); return false; }
+        }
+    }
     return true;
 }
 

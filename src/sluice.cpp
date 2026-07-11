@@ -53,21 +53,44 @@ void insertion(U* a, size_t n) {
 //
 // Key precision loss for wide U only affects placement; the insertion pass
 // repairs any local disorder, so a successful result is always correct.
+// Exact bucket index = (off * (n-1)) / range, with off in [0, range] and
+// range >= 1, so the result is always in [0, n-1]. Uses 128-bit integers where
+// available (all mainstream 64-bit GCC/Clang, incl. AArch64 and MinGW); for
+// <=32-bit keys uint64 already suffices. The only fallback that touches
+// floating point is 64-bit keys on a platform without 128-bit ints — and even
+// then `range` was formed by integer subtraction so it is >= 1, meaning
+// (double)range >= 1 and there is NO division by zero. The bucket is only an
+// estimate anyway; interp_small's repair pass and skew guard keep results
+// correct regardless of rounding.
+template <class U>
+inline int interp_bucket(U off, unsigned nm1, U range) {
+#if defined(__SIZEOF_INT128__)
+    return static_cast<int>((static_cast<unsigned __int128>(off) * nm1) / range);
+#else
+    if (sizeof(U) <= sizeof(uint32_t))
+        return static_cast<int>((static_cast<uint64_t>(off) * nm1) / range);
+    double k = static_cast<double>(off) * static_cast<double>(nm1)
+             / static_cast<double>(range);
+    int ki = static_cast<int>(k);
+    return ki < 0 ? 0 : (ki > static_cast<int>(nm1) ? static_cast<int>(nm1) : ki);
+#endif
+}
+
 template <class U>
 bool interp_small(U* a, int n) {
     if (n < 2) return true;
     U mn = a[0], mx = a[0];
     for (int i = 1; i < n; ++i) { U x = a[i]; if (x < mn) mn = x; else if (x > mx) mx = x; }
     if (mn == mx) return true;
-    const double scale = double(n - 1) / (double(mx) - double(mn));
+    const U range = static_cast<U>(mx - mn);         // exact integer diff, >= 1
+    const unsigned nm1 = static_cast<unsigned>(n - 1);
     uint16_t key[INTERP_MAX];
     int      cnt[INTERP_MAX + 1];
     U        out[INTERP_MAX];
     for (int i = 0; i < n; ++i) cnt[i] = 0;
     int maxbucket = 0;
     for (int i = 0; i < n; ++i) {
-        int k = int((double(a[i]) - double(mn)) * scale);
-        if (k >= n) k = n - 1;                 // guard float round-up
+        int k = interp_bucket<U>(static_cast<U>(a[i] - mn), nm1, range);  // in [0, n-1]
         key[i] = static_cast<uint16_t>(k);
         int c = ++cnt[k];
         if (c > maxbucket) maxbucket = c;
@@ -191,6 +214,9 @@ SLUICE_API void sluice_sort_u64_ordered(uint64_t* data, size_t n, sluice_order o
     if (order == SLUICE_DESCENDING) std::reverse(data, data + n);
 }
 SLUICE_API void sluice_sort_i32_ordered(int32_t* data, size_t n, sluice_order order) {
+    // Accessing int32_t objects through a uint32_t lvalue is permitted: the
+    // unsigned type corresponding to the dynamic type is an allowed alias
+    // ([basic.lval]). Verified clean under -Wstrict-aliasing=2 and UBSan.
     uint32_t* u = reinterpret_cast<uint32_t*>(data);
     flip_sign_bit(u, n);
     sluice_core(u, n);
@@ -198,7 +224,7 @@ SLUICE_API void sluice_sort_i32_ordered(int32_t* data, size_t n, sluice_order or
     if (order == SLUICE_DESCENDING) std::reverse(data, data + n);
 }
 SLUICE_API void sluice_sort_i64_ordered(int64_t* data, size_t n, sluice_order order) {
-    uint64_t* u = reinterpret_cast<uint64_t*>(data);
+    uint64_t* u = reinterpret_cast<uint64_t*>(data);   // signed<->unsigned alias: OK
     flip_sign_bit(u, n);
     sluice_core(u, n);
     flip_sign_bit(u, n);

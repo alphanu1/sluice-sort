@@ -104,7 +104,7 @@ EXE        := $(BUILD)/$(NAME)$(EXE_EXT)
 
 AR ?= ar
 
-.PHONY: all static shared exe test bench clean all-targets info
+.PHONY: all static shared exe test bench sanitize strict clean all-targets info
 all: static shared exe
 	@echo "==> $(TARGET): built static + shared + exe in $(BUILD)/  (CXX=$(CXX))"
 
@@ -138,6 +138,21 @@ test: exe
 	@./$(EXE) --test
 bench: exe
 	@./$(EXE) --bench
+
+# Build the CLI with ASan + UBSan (incl. float-cast-overflow) and run the
+# self-test. Catches memory errors and undefined behaviour (e.g. bad float->int
+# conversions) that a normal build silently tolerates.
+sanitize:
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined,float-cast-overflow \
+	  -fno-sanitize-recover=all -I$(INC_DIR) $(LIB_SRC) $(CLI_SRC) -o $(BUILD)/$(NAME)-san
+	@$(BUILD)/$(NAME)-san --test
+
+# Compile the library under strict warnings; fails the build on any warning.
+strict:
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror \
+	  -I$(INC_DIR) -c $(LIB_SRC) -o $(BUILD)/sluice.strict.o && echo "strict: no warnings"
 
 all-targets:
 	@for t in linux windows macos; do \

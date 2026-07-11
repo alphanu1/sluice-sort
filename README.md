@@ -21,7 +21,10 @@ on integer data. The interpolation path (Flashsort, Neubert 1998 — see
 [References](#references)) computes each element's approximate position
 directly and repairs locally; its O(n²) worst case is defused by
 capping it to n <= 512 plus a skew guard that hands off to radix the moment
-any bucket grows too large — so the O(n²) tail can never trigger.
+any bucket grows too large — so the O(n²) tail can never trigger. Bucket indices
+use exact integer arithmetic (128-bit intermediate where available), so there is
+no floating-point division-by-zero even for adjacent 64-bit magnitudes that
+collide when cast to `double`.
 
 **Sort direction.** Ascending is the default. Every type also has an `_ordered`
 entry point taking `SLUICE_ASCENDING` or `SLUICE_DESCENDING`; descending is the
@@ -77,6 +80,17 @@ lines:
 Note radix's high cost at tiny n (its per-call heap allocation dominates) — the
 exact reason Sluice uses interpolation, not radix, below n=512.
 
+**Sluice vs radix.** Past n=512 Sluice *is* radix internally, so its line tracks
+the radix line closely: faster below 512 (interpolation, and radix's small-n
+allocation cost), then within a few percent above radix from ~1024 up. That
+small gap is the one extra min/max/"already sorted?" scan pass the dispatcher
+runs before choosing a path — the price of being adaptive, and exactly what lets
+Sluice shortcut to the counting/early-exit paths that win big on sorted or
+bounded data. (All seven curves here are built with the *same* flags — the
+library's default portable `-O3` — so the comparison is apples-to-apples; an
+earlier version of this chart accidentally compiled the reference radix with
+`-march=native` and the library without, which exaggerated the gap.)
+
 ### Interpolation vs radix in the n ≤ 512 band
 
 The small-array band dispatches to interpolation rather than radix (the general
@@ -103,8 +117,7 @@ crossover, beyond which radix wins and the dispatcher switches to it.
 - **Integer keys only:** `uint32/int32/uint64/int64`. Radix needs fixed-width
   decomposable keys; this is the deliberate trade — specialization for speed.
   `std::sort` remains the right tool for arbitrary comparables.
-- Signed types are mapped to the unsigned domain (sign-bit flip) and back.
-- Uses ~n auxiliary memory (radix) or O(range) (counting); `std::sort` is
+- Signed types are mapped to the unsigned domain (sign-bit flip) and back.- Uses ~n auxiliary memory (radix) or O(range) (counting); `std::sort` is
   in-place. The `std::sort` fallback covers allocation failure.
 - Equal integers are indistinguishable, so results are stable by construction.
 - Not novel research: this is a well-engineered combination of established
@@ -142,7 +155,15 @@ Native (autodetects Linux / macOS / Windows host):
 make            # static lib + shared lib + CLI executable
 make test       # run the correctness self-test
 make bench      # run the benchmark
+make sanitize   # build with ASan+UBSan (incl. float-cast-overflow), run self-test
+make strict     # compile under -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror
 ```
+
+The self-test fuzzes against `std::sort` across u32/i32/u64, every dispatch
+boundary (15/16/17, 31/32/33, 511/512/513, 999/1000/1001, 100k, 1M), six input
+shapes (random, bounded, duplicate-heavy, nearly-sorted, reverse-sorted,
+all-equal), and adversarial 64-bit magnitudes (values near 2⁵³/2⁶³/UINT64_MAX
+and INT64_MIN/MAX). It is clean under ASan+UBSan and the strict warning set.
 
 Artifacts land in `build/<target>/`:
 
