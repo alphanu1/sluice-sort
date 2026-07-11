@@ -77,11 +77,25 @@ template <class C, class T = detail::elem_t<C>> std::size_t top(C& c, std::size_
 // ---- with profiling (routes through the unified C dispatcher) ----
 template <class T>
 sluice_status sort(T* d, std::size_t n, sluice_stats& stats, sluice_order o = SLUICE_ASCENDING) {
-    return sluice_sort(detail::traits<T>::dtype, d, n, /*select=*/0, &o, /*collect=*/1, &stats);
+    return sluice_sort(detail::traits<T>::dtype, d, n, /*select=*/0, &o, /*collect=*/1, &stats, /*cfg=*/nullptr);
 }
 template <class C, class T = detail::elem_t<C>>
 sluice_status sort(C& c, sluice_stats& stats, sluice_order o = SLUICE_ASCENDING) {
-    return sluice_sort(detail::traits<T>::dtype, c.data(), c.size(), /*select=*/0, &o, /*collect=*/1, &stats);
+    return sluice_sort(detail::traits<T>::dtype, c.data(), c.size(), /*select=*/0, &o, /*collect=*/1, &stats, /*cfg=*/nullptr);
+}
+
+// ---- with custom dispatch config (and optionally stats) ----
+template <class T>
+sluice_status sort(T* d, std::size_t n, const sluice_config& cfg, sluice_order o = SLUICE_ASCENDING) {
+    return sluice_sort(detail::traits<T>::dtype, d, n, 0, &o, 0, nullptr, &cfg);
+}
+template <class C, class T = detail::elem_t<C>>
+sluice_status sort(C& c, const sluice_config& cfg, sluice_order o = SLUICE_ASCENDING) {
+    return sluice_sort(detail::traits<T>::dtype, c.data(), c.size(), 0, &o, 0, nullptr, &cfg);
+}
+template <class C, class T = detail::elem_t<C>>
+sluice_status sort(C& c, const sluice_config& cfg, sluice_stats& stats, sluice_order o = SLUICE_ASCENDING) {
+    return sluice_sort(detail::traits<T>::dtype, c.data(), c.size(), 0, &o, 1, &stats, &cfg);
 }
 
 }  // namespace sluice

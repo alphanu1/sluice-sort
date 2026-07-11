@@ -220,32 +220,32 @@ static bool self_test() {
             std::vector<int32_t> g(base); std::sort(g.begin(), g.end());
             // sort all, ascending, no stats
             std::vector<int32_t> a(base);
-            if (sluice_sort(SLUICE_I32, a.data(), n, 0, nullptr, 0, nullptr) != SLUICE_OK ||
+            if (sluice_sort(SLUICE_I32, a.data(), n, 0, nullptr, 0, nullptr, nullptr) != SLUICE_OK ||
                 a != g) { std::printf("  unified i32 sort FAIL n=%zu\n", n); return false; }
             // first k via select>0
             size_t k = n ? (r() % n) : 0;
             std::vector<int32_t> f(base);
             sluice_order asc = SLUICE_ASCENDING;
-            sluice_sort(SLUICE_I32, f.data(), n, static_cast<ptrdiff_t>(k), &asc, 0, nullptr);
+            sluice_sort(SLUICE_I32, f.data(), n, static_cast<ptrdiff_t>(k), &asc, 0, nullptr, nullptr);
             if (!std::equal(g.begin(), g.begin() + std::min(k,n), f.begin())) { std::printf("  unified first FAIL\n"); return false; }
             // top k via select<0
             std::vector<int32_t> tp(base);
-            sluice_sort(SLUICE_I32, tp.data(), n, -static_cast<ptrdiff_t>(k), &asc, 0, nullptr);
+            sluice_sort(SLUICE_I32, tp.data(), n, -static_cast<ptrdiff_t>(k), &asc, 0, nullptr, nullptr);
             if (!std::equal(g.end() - std::min(k,n), g.end(), tp.begin())) { std::printf("  unified top FAIL\n"); return false; }
         }
         // stats path: already-sorted detection + correctness
         std::vector<uint32_t> srt(1000); for (size_t i=0;i<srt.size();++i) srt[i]=static_cast<uint32_t>(i);
         sluice_stats s;
-        if (sluice_sort(SLUICE_U32, srt.data(), srt.size(), 0, nullptr, 1, &s) != SLUICE_OK) { std::printf("  stats rc FAIL\n"); return false; }
+        if (sluice_sort(SLUICE_U32, srt.data(), srt.size(), 0, nullptr, 1, &s, nullptr) != SLUICE_OK) { std::printf("  stats rc FAIL\n"); return false; }
         if (!s.already_sorted || std::strcmp(s.algorithm, "already sorted") != 0) { std::printf("  stats already_sorted FAIL\n"); return false; }
         // stats with duplicates + bounded range -> counting
         std::vector<uint32_t> dup(50000); std::mt19937 r2(7); for (auto& x : dup) x = r2() % 100;
         std::vector<uint32_t> dgold(dup); std::sort(dgold.begin(), dgold.end());
-        sluice_sort(SLUICE_U32, dup.data(), dup.size(), 0, nullptr, 1, &s);
+        sluice_sort(SLUICE_U32, dup.data(), dup.size(), 0, nullptr, 1, &s, nullptr);
         if (dup != dgold || s.duplicate_pct < 99.0 || std::strcmp(s.algorithm,"counting") != 0) { std::printf("  stats counting FAIL\n"); return false; }
         // error paths
-        if (sluice_sort(static_cast<sluice_dtype>(42), nullptr, 0, 0, nullptr, 0, nullptr) != SLUICE_ERR_TYPE) { std::printf("  bad-type FAIL\n"); return false; }
-        if (sluice_sort(SLUICE_U32, dup.data(), 1, 0, nullptr, 1, nullptr) != SLUICE_ERR_NULL) { std::printf("  null-stats FAIL\n"); return false; }
+        if (sluice_sort(static_cast<sluice_dtype>(42), nullptr, 0, 0, nullptr, 0, nullptr, nullptr) != SLUICE_ERR_TYPE) { std::printf("  bad-type FAIL\n"); return false; }
+        if (sluice_sort(SLUICE_U32, dup.data(), 1, 0, nullptr, 1, nullptr, nullptr) != SLUICE_ERR_NULL) { std::printf("  null-stats FAIL\n"); return false; }
     }
 
     // --- float first_n / top_n -------------------------------------------
@@ -256,6 +256,45 @@ static bool self_test() {
         if (w != 3 || !std::equal(g.begin(), g.begin()+3, f.begin())) { std::printf("  f32 first_n FAIL\n"); return false; }
         std::vector<float> tp(base); w = sluice_top_n_f32(tp.data(), tp.size(), 3, SLUICE_ASCENDING);
         if (w != 3 || !std::equal(g.end()-3, g.end(), tp.begin())) { std::printf("  f32 top_n FAIL\n"); return false; }
+    }
+
+    // --- custom dispatch config ------------------------------------------
+    {
+        // config_init fills defaults
+        sluice_config c; sluice_config_init(&c);
+        if (c.insertion_limit != 16 || c.interpolation_limit != 512 ||
+            c.interpolation_skew != 32 || c.counting_load != 4 || c.counting_cap != (1u<<21)) {
+            std::printf("  config defaults FAIL\n"); return false;
+        }
+        std::mt19937 r(2024);
+        // custom thresholds must still sort correctly across sizes/types
+        for (int t = 0; t < 200; ++t) {
+            size_t n = r() % 3000;
+            std::vector<uint32_t> a(n); for (auto& x : a) x = r();
+            std::vector<uint32_t> g(a); std::sort(g.begin(), g.end());
+            sluice_config cfg = {0,0,0,0,0};
+            cfg.interpolation_limit = 768;   // raised past the default 512 (heap scratch)
+            cfg.counting_load = 8;
+            if (sluice_sort(SLUICE_U32, a.data(), n, 0, nullptr, 0, nullptr, &cfg) != SLUICE_OK || a != g) {
+                std::printf("  config sort FAIL n=%zu\n", n); return false; }
+        }
+        // a raised interpolation_limit should actually route n=700 to interpolation
+        {
+            std::vector<uint32_t> a(700); for (auto& x : a) x = r();
+            sluice_config cfg = {0,0,0,0,0}; cfg.interpolation_limit = 1024;
+            sluice_stats s;
+            sluice_sort(SLUICE_U32, a.data(), a.size(), 0, nullptr, 1, &s, &cfg);
+            if (std::strcmp(s.algorithm, "interpolation") != 0) { std::printf("  config interp route FAIL (%s)\n", s.algorithm); return false; }
+        }
+        // a zeroed-but-for-one-field config leaves other knobs at default
+        {
+            std::vector<uint32_t> a(50000); std::mt19937 rr(5); for (auto& x : a) x = rr() % 5000;
+            std::vector<uint32_t> g(a); std::sort(g.begin(), g.end());
+            sluice_config cfg = {0,0,0,0,0}; cfg.counting_cap = 1u << 10;  // tiny cap -> forces radix
+            sluice_stats s;
+            sluice_sort(SLUICE_U32, a.data(), a.size(), 0, nullptr, 1, &s, &cfg);
+            if (a != g || std::strcmp(s.algorithm, "radix") != 0) { std::printf("  config cap FAIL (%s)\n", s.algorithm); return false; }
+        }
     }
     return true;
 }

@@ -346,6 +346,30 @@ The specialized `sluice_sort_*` / `sluice_first_n_*` / `sluice_top_n_*` function
 remain the fastest route and are unchanged; the dispatcher is a convenience over
 them (with optional profiling that the fast path never pays for).
 
+### Custom dispatch tuning
+
+The dispatch thresholds are CPU-dependent — the best interpolation cutoff or
+counting-sort load factor differs across machines. Pass a `sluice_config` to
+override any of them; a field left `0` keeps its default, or call
+`sluice_config_init` to fill defaults and tweak from there.
+
+```c
+sluice_config cfg = {0};        /* all defaults */
+cfg.interpolation_limit = 768;  /* interpolate for larger arrays on this CPU */
+cfg.counting_load       = 8;    /* accept counting sort over a wider range   */
+sluice_sort(SLUICE_U32, data, n, 0, NULL, 0, NULL, &cfg);
+```
+```cpp
+sluice::sort(v, cfg);           // C++ wrapper; sluice::sort(v, cfg, stats) too
+```
+
+Fields: `insertion_limit`, `interpolation_limit`, `interpolation_skew`,
+`counting_load`, `counting_cap`. Supplying a config routes through the general
+engine rather than the in-place specialized path (a small cost), so it's for
+tuning and profiling, not the hot path. `interpolation_limit` is clamped to an
+internal ceiling (4096); values above the default 512 use heap scratch instead
+of the stack.
+
 ## API
 
 ```c
@@ -393,9 +417,19 @@ typedef struct {
     size_t      n;
 } sluice_stats;
 /* select: >0 first N, <0 top |N|, 0 all.  order: NULL = ascending.
-   collect_stats: 0 = fast path, 1 = fill stats (must be non-NULL). */
+   collect_stats: 0 = fast path, 1 = fill stats (must be non-NULL).
+   cfg: NULL = default thresholds, else custom dispatch tuning. */
+typedef struct {
+    size_t   insertion_limit;      /* n < this -> insertion       (default 16)      */
+    size_t   interpolation_limit;  /* n <= this -> interpolation  (default 512)     */
+    int      interpolation_skew;   /* interp skew bail            (default 32)      */
+    uint64_t counting_load;        /* counting if range <= load*n (default 4)       */
+    uint64_t counting_cap;         /* ...and range < cap          (default 2097152) */
+} sluice_config;
+void          sluice_config_init(sluice_config* cfg);
 sluice_status sluice_sort(sluice_dtype type, void* data, size_t n, ptrdiff_t select,
-                          const sluice_order* order, int collect_stats, sluice_stats* stats);
+                          const sluice_order* order, int collect_stats,
+                          sluice_stats* stats, const sluice_config* cfg);
 
 int         sluice_is_sorted_u32(const uint32_t* data, size_t n);
 const char* sluice_version(void);

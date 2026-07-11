@@ -127,15 +127,33 @@ typedef struct {
     size_t      n;              /* element count */
 } sluice_stats;
 
+/* Dispatch tuning. Optimal thresholds vary by CPU; override any you like.
+ * A field left 0 uses the compiled-in default, so `sluice_config c = {0};
+ * c.interpolation_limit = 768;` changes only that one knob. Or call
+ * sluice_config_init(&c) to fill every field with its default, then tweak.
+ * interpolation_limit is clamped to an internal ceiling (4096). */
+typedef struct {
+    size_t   insertion_limit;      /* n < this -> insertion sort   (default 16)      */
+    size_t   interpolation_limit;  /* n <= this -> interpolation   (default 512)     */
+    int      interpolation_skew;   /* interp bucket-skew bail      (default 32)      */
+    uint64_t counting_load;        /* counting if range <= load*n  (default 4)       */
+    uint64_t counting_cap;         /* ...and range < cap           (default 2097152) */
+} sluice_config;
+
+/* Fill cfg with the default thresholds. */
+SLUICE_API void sluice_config_init(sluice_config* cfg);
+
 /* Unified sort. `type` selects the element type; `select` > 0 keeps the first N
  * (smallest/head), < 0 keeps the top |N| (largest/tail), 0 sorts everything;
  * `order` may be NULL for ascending. When `collect_stats` is nonzero, `stats`
- * (must be non-NULL) is filled with profiling info at some cost; when 0, this
- * dispatches straight to the specialized fast path with no profiling overhead.
+ * (must be non-NULL) is filled with profiling info at some cost. `cfg` may be
+ * NULL for default thresholds; when non-NULL, custom tuning is applied (this
+ * routes through the general engine rather than the in-place specialized path).
  * Returns SLUICE_OK, SLUICE_ERR_TYPE, or SLUICE_ERR_NULL. */
 SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
                                      ptrdiff_t select, const sluice_order* order,
-                                     int collect_stats, sluice_stats* stats);
+                                     int collect_stats, sluice_stats* stats,
+                                     const sluice_config* cfg);
 
 /* Returns 1 if the array is already in non-decreasing order, else 0.
  * Provided because "is it already sorted?" is a cheap, common query. */

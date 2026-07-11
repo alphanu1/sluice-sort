@@ -17,6 +17,9 @@
 namespace {
 
 // --- tuning knobs -------------------------------------------------------
+// Compiled-in defaults. These are also the values the specialized fast
+// functions always use (no config path), so they stay branch-for-branch as
+// today.
 constexpr size_t   INSERTION_MAX  = 16;        // n < this: insertion sort
 constexpr size_t   INTERP_MAX     = 512;       // n <= this: interpolation place
 constexpr int      INTERP_SKEW    = 32;        // bail to radix if a bucket
@@ -24,6 +27,21 @@ constexpr int      INTERP_SKEW    = 32;        // bail to radix if a bucket
                                                //   work to <= 32n, defuses O(n^2))
 constexpr uint64_t COUNTING_LOAD  = 4;         // counting if range <= LOAD*n
 constexpr uint64_t COUNTING_CAP   = 1ull << 21;// ...and range <= ~2.1M slots
+
+// Hard ceiling on interpolation_max: the interp path uses fixed stack scratch
+// sized to this, so a user-supplied interpolation_max is clamped here.
+constexpr size_t   INTERP_CAP     = 4096;
+
+// Runtime thresholds threaded through the engine when a config is supplied.
+// Default-constructed == the compiled-in defaults above.
+struct Thresholds {
+    size_t   insertion_max  = INSERTION_MAX;
+    size_t   interp_max     = INTERP_MAX;
+    int      interp_skew    = INTERP_SKEW;
+    uint64_t counting_load  = COUNTING_LOAD;
+    uint64_t counting_cap   = COUNTING_CAP;
+};
+
 
 // --- insertion sort (tiny arrays; also the base case) -------------------
 template <class U>
@@ -78,16 +96,27 @@ inline int interp_bucket(U off, unsigned nm1, U range) {
 }
 
 template <class U>
-bool interp_small(U* a, int n) {
+bool interp_small(U* a, int n, int skew) {
     if (n < 2) return true;
     U mn = a[0], mx = a[0];
     for (int i = 1; i < n; ++i) { U x = a[i]; if (x < mn) mn = x; else if (x > mx) mx = x; }
     if (mn == mx) return true;
     const U range = static_cast<U>(mx - mn);         // exact integer diff, >= 1
     const unsigned nm1 = static_cast<unsigned>(n - 1);
-    uint16_t key[INTERP_MAX];
-    int      cnt[INTERP_MAX + 1];
-    U        out[INTERP_MAX];
+
+    // Scratch stays on the stack for the default band (n <= INTERP_MAX); a
+    // config that raises interpolation_max up to INTERP_CAP spills to the heap
+    // (and bails to radix if that allocation fails). The fast path is unchanged.
+    uint16_t key_s[INTERP_MAX]; int cnt_s[INTERP_MAX + 1]; U out_s[INTERP_MAX];
+    std::vector<uint16_t> key_h; std::vector<int> cnt_h; std::vector<U> out_h;
+    uint16_t* key = key_s; int* cnt = cnt_s; U* out = out_s;
+    if (n > static_cast<int>(INTERP_MAX)) {
+        try { key_h.resize(static_cast<size_t>(n)); cnt_h.resize(static_cast<size_t>(n) + 1);
+              out_h.resize(static_cast<size_t>(n)); }
+        catch (const std::bad_alloc&) { return false; }
+        key = key_h.data(); cnt = cnt_h.data(); out = out_h.data();
+    }
+
     for (int i = 0; i < n; ++i) cnt[i] = 0;
     int maxbucket = 0;
     for (int i = 0; i < n; ++i) {
@@ -96,7 +125,7 @@ bool interp_small(U* a, int n) {
         int c = ++cnt[k];
         if (c > maxbucket) maxbucket = c;
     }
-    if (maxbucket > INTERP_SKEW) return false; // skewed -> let radix handle it
+    if (maxbucket > skew) return false;        // skewed -> let radix handle it
     int sum = 0;
     for (int i = 0; i < n; ++i) { int c = cnt[i]; cnt[i] = sum; sum += c; }
     for (int i = 0; i < n; ++i) out[cnt[key[i]]++] = a[i];
@@ -156,15 +185,15 @@ void radix(U* a, size_t n) {
 struct core_path { const char* algorithm; int passes; };
 
 template <class U>
-void sluice_core(U* a, size_t n, core_path* path = nullptr) {
+void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th = Thresholds{}) {
     auto note = [&](const char* alg, int passes) { if (path) { path->algorithm = alg; path->passes = passes; } };
     note("insertion", 0);
     if (n < 2) return;
-    if (n < INSERTION_MAX) { insertion(a, n); return; }
+    if (n < th.insertion_max) { insertion(a, n); return; }
     // small arrays: the interpolation placement sort wins here. If it detects
     // skew it returns false and we fall through to radix (n is small, so the
     // radix allocation is tiny).
-    if (n <= INTERP_MAX && interp_small(a, static_cast<int>(n))) { note("interpolation", 0); return; }
+    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew)) { note("interpolation", 0); return; }
 
     // one scan: min, max, and "already sorted?" — cheap, high-value.
     U mn = a[0], mx = a[0];
@@ -180,7 +209,7 @@ void sluice_core(U* a, size_t n, core_path* path = nullptr) {
     const uint64_t range = static_cast<uint64_t>(mx) - static_cast<uint64_t>(mn);
 
     // bounded range -> counting sort (pure O(n), no comparisons)
-    if (range < COUNTING_CAP && range <= COUNTING_LOAD * static_cast<uint64_t>(n)) {
+    if (range < th.counting_cap && range <= th.counting_load * static_cast<uint64_t>(n)) {
         try { counting(a, n, mn, range); note("counting", 0); return; }
         catch (const std::bad_alloc&) { /* fall through */ }
     }
@@ -222,16 +251,20 @@ inline uint64_t to_key(uint64_t v, Domain d)   { return d==Domain::Float ? fkey6
 inline uint32_t from_key(uint32_t k, Domain d) { return d==Domain::Float ? funkey32(k) : (d==Domain::Signed ? (k ^ 0x80000000u)          : k); }
 inline uint64_t from_key(uint64_t k, Domain d) { return d==Domain::Float ? funkey64(k) : (d==Domain::Signed ? (k ^ 0x8000000000000000ull) : k); }
 
-// Instrumented sort: transforms to keys, profiles the run (algorithm, timing,
-// memory, passes, already-sorted, duplicate %, range), then applies the
-// direction and first/top selection and writes results back. Used only when the
-// caller asks for stats — the fast path never allocates this key buffer.
+// Engine-backed sort used whenever custom thresholds and/or stats are needed.
+// Transforms to keys, (optionally) profiles the run, sorts via sluice_core with
+// the given thresholds, then applies direction + first/top selection. When
+// `st` is null it just sorts with the thresholds (no profiling work).
 template <class T, class KeyT>
-sluice_status sort_stats(T* data, size_t n, ptrdiff_t select, sluice_order order,
-                         sluice_stats* st, Domain dom) {
-    st->algorithm = "none"; st->time_ms = 0.0; st->memory_bytes = 0;
-    st->passes = 0; st->already_sorted = 1; st->duplicate_pct = 0.0;
-    st->range = 0.0; st->n = n;
+sluice_status run(T* data, size_t n, ptrdiff_t select, sluice_order order,
+                  sluice_stats* st, const Thresholds& th, Domain dom) {
+    if (st) { st->algorithm = "none"; st->time_ms = 0.0; st->memory_bytes = 0;
+              st->passes = 0; st->already_sorted = 1; st->duplicate_pct = 0.0;
+              st->range = 0.0; st->n = n; }
+    auto apply_select = [&]() {
+        if (select < 0) { size_t k = static_cast<size_t>(-select); if (k > n) k = n;
+            if (k && k < n) std::memmove(data, data + (n - k), k * sizeof(T)); }
+    };
     if (n < 2) return SLUICE_OK;
 
     std::vector<KeyT> keys;
@@ -239,47 +272,44 @@ sluice_status sort_stats(T* data, size_t n, ptrdiff_t select, sluice_order order
     catch (const std::bad_alloc&) {
         std::sort(data, data + n);
         if (order == SLUICE_DESCENDING) std::reverse(data, data + n);
-        st->algorithm = "std::sort"; return SLUICE_OK;
+        if (st) st->algorithm = "std::sort";
+        apply_select();
+        return SLUICE_OK;
     }
 
-    KeyT first; std::memcpy(&first, &data[0], sizeof first); first = to_key(first, dom);
-    KeyT mn = first, mx = first; keys[0] = first;
-    bool sorted = true;
+    KeyT mn, mx; bool sorted = true;
+    { KeyT k0; std::memcpy(&k0, &data[0], sizeof k0); k0 = to_key(k0, dom); mn = mx = k0; keys[0] = k0; }
     for (size_t i = 1; i < n; ++i) {
         KeyT k; std::memcpy(&k, &data[i], sizeof k); k = to_key(k, dom);
         keys[i] = k;
-        if (k < keys[i - 1]) sorted = false;
-        if (k < mn) mn = k; else if (k > mx) mx = k;
+        if (st) { if (k < keys[i - 1]) sorted = false; if (k < mn) mn = k; else if (k > mx) mx = k; }
     }
-    st->already_sorted = sorted ? 1 : 0;
-    st->range = static_cast<double>(mx) - static_cast<double>(mn);
 
     core_path path{ "insertion", 0 };
-    auto t0 = std::chrono::steady_clock::now();
-    sluice_core(keys.data(), n, &path);
-    auto t1 = std::chrono::steady_clock::now();
-    st->time_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    st->algorithm = path.algorithm;
-    st->passes    = path.passes;
-
-    size_t distinct = 1;
-    for (size_t i = 1; i < n; ++i) if (keys[i] != keys[i - 1]) ++distinct;
-    st->duplicate_pct = 100.0 * (1.0 - static_cast<double>(distinct) / static_cast<double>(n));
-
-    size_t mem = 0;
-    if (std::strcmp(path.algorithm, "radix") == 0)
-        mem = n * sizeof(KeyT);
-    else if (std::strcmp(path.algorithm, "counting") == 0)
-        mem = (static_cast<size_t>(st->range) + 1) * sizeof(size_t);
-    if (dom == Domain::Float) mem += n * sizeof(KeyT);   // the transform buffer
-    st->memory_bytes = mem;
+    if (st) {
+        st->already_sorted = sorted ? 1 : 0;
+        st->range = static_cast<double>(mx) - static_cast<double>(mn);
+        auto t0 = std::chrono::steady_clock::now();
+        sluice_core(keys.data(), n, &path, th);
+        auto t1 = std::chrono::steady_clock::now();
+        st->time_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        st->algorithm = path.algorithm;
+        st->passes    = path.passes;
+        size_t distinct = 1;
+        for (size_t i = 1; i < n; ++i) if (keys[i] != keys[i - 1]) ++distinct;
+        st->duplicate_pct = 100.0 * (1.0 - static_cast<double>(distinct) / static_cast<double>(n));
+        size_t mem = 0;
+        if (std::strcmp(path.algorithm, "radix") == 0)         mem = n * sizeof(KeyT);
+        else if (std::strcmp(path.algorithm, "counting") == 0) mem = (static_cast<size_t>(st->range) + 1) * sizeof(size_t);
+        if (dom == Domain::Float) mem += n * sizeof(KeyT);
+        st->memory_bytes = mem;
+    } else {
+        sluice_core(keys.data(), n, nullptr, th);
+    }
 
     if (order == SLUICE_DESCENDING) std::reverse(keys.begin(), keys.end());
     for (size_t i = 0; i < n; ++i) { KeyT b = from_key(keys[i], dom); std::memcpy(&data[i], &b, sizeof b); }
-    if (select < 0) {                                    // top |select|: tail -> front
-        size_t k = static_cast<size_t>(-select); if (k > n) k = n;
-        if (k && k < n) std::memmove(data, data + (n - k), k * sizeof(T));
-    }
+    apply_select();
     return SLUICE_OK;
 }
 
@@ -416,14 +446,26 @@ SLUICE_API size_t sluice_top_n_f64(double* data, size_t n, size_t k, sluice_orde
         else                 sluice_sort_##SUF##_ordered(p, n, ord);            \
     } while (0)
 
+SLUICE_API void sluice_config_init(sluice_config* cfg) {
+    if (!cfg) return;
+    Thresholds d;
+    cfg->insertion_limit     = d.insertion_max;
+    cfg->interpolation_limit = d.interp_max;
+    cfg->interpolation_skew  = d.interp_skew;
+    cfg->counting_load       = d.counting_load;
+    cfg->counting_cap        = d.counting_cap;
+}
+
 SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
                                      ptrdiff_t select, const sluice_order* order,
-                                     int collect_stats, sluice_stats* stats) {
+                                     int collect_stats, sluice_stats* stats,
+                                     const sluice_config* cfg) {
     const sluice_order ord = order ? *order : SLUICE_ASCENDING;
     if (data == nullptr && n > 0) return SLUICE_ERR_NULL;
     if (collect_stats && stats == nullptr) return SLUICE_ERR_NULL;
 
-    if (!collect_stats) {
+    // Fast path: default thresholds and no stats -> in-place specialized funcs.
+    if (!collect_stats && cfg == nullptr) {
         switch (type) {
             case SLUICE_U32: SLUICE_FAST(u32, uint32_t); break;
             case SLUICE_I32: SLUICE_FAST(i32, int32_t);  break;
@@ -435,13 +477,25 @@ SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
         }
         return SLUICE_OK;
     }
+
+    // Custom thresholds and/or stats: build thresholds (0 = default; clamp
+    // insertion/interp to the stack-scratch ceiling) and run the engine path.
+    Thresholds th;
+    if (cfg) {
+        if (cfg->insertion_limit)     th.insertion_max = cfg->insertion_limit < INTERP_CAP ? cfg->insertion_limit : INTERP_CAP;
+        if (cfg->interpolation_limit) th.interp_max    = cfg->interpolation_limit < INTERP_CAP ? cfg->interpolation_limit : INTERP_CAP;
+        if (cfg->interpolation_skew)  th.interp_skew   = cfg->interpolation_skew;
+        if (cfg->counting_load)       th.counting_load = cfg->counting_load;
+        if (cfg->counting_cap)        th.counting_cap  = cfg->counting_cap;
+    }
+    sluice_stats* st = collect_stats ? stats : nullptr;
     switch (type) {
-        case SLUICE_U32: return sort_stats<uint32_t, uint32_t>(static_cast<uint32_t*>(data), n, select, ord, stats, Domain::Unsigned);
-        case SLUICE_I32: return sort_stats<int32_t,  uint32_t>(static_cast<int32_t*>(data),  n, select, ord, stats, Domain::Signed);
-        case SLUICE_U64: return sort_stats<uint64_t, uint64_t>(static_cast<uint64_t*>(data), n, select, ord, stats, Domain::Unsigned);
-        case SLUICE_I64: return sort_stats<int64_t,  uint64_t>(static_cast<int64_t*>(data),  n, select, ord, stats, Domain::Signed);
-        case SLUICE_F32: return sort_stats<float,    uint32_t>(static_cast<float*>(data),    n, select, ord, stats, Domain::Float);
-        case SLUICE_F64: return sort_stats<double,   uint64_t>(static_cast<double*>(data),   n, select, ord, stats, Domain::Float);
+        case SLUICE_U32: return run<uint32_t, uint32_t>(static_cast<uint32_t*>(data), n, select, ord, st, th, Domain::Unsigned);
+        case SLUICE_I32: return run<int32_t,  uint32_t>(static_cast<int32_t*>(data),  n, select, ord, st, th, Domain::Signed);
+        case SLUICE_U64: return run<uint64_t, uint64_t>(static_cast<uint64_t*>(data), n, select, ord, st, th, Domain::Unsigned);
+        case SLUICE_I64: return run<int64_t,  uint64_t>(static_cast<int64_t*>(data),  n, select, ord, st, th, Domain::Signed);
+        case SLUICE_F32: return run<float,    uint32_t>(static_cast<float*>(data),    n, select, ord, st, th, Domain::Float);
+        case SLUICE_F64: return run<double,   uint64_t>(static_cast<double*>(data),   n, select, ord, st, th, Domain::Float);
         default: return SLUICE_ERR_TYPE;
     }
 }
