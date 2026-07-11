@@ -1,17 +1,27 @@
 // ==========================================================================
-// Sluice engine implementation.
+// Sluice — an adaptive numeric sorting engine.
 //
-// One templated core operates on UNSIGNED integers. Signed entry points map
-// their input to the unsigned domain with an order-preserving bijection
-// (flip the sign bit), sort, then map back — so radix and counting logic stay
-// uniform and branch-free.
+// Author: Alphanu1 / Ben Templaman
+// Since:  2026-07-08
+//
+// One templated core sorts UNSIGNED integer keys, dispatching among insertion,
+// interpolation (Flashsort), counting, and radix by input shape. Every public
+// element type is mapped onto that core by an order-preserving key transform,
+// then mapped back:
+//   * unsigned integers -> used directly
+//   * signed integers   -> flip the sign bit
+//   * float / double    -> IEEE-754 order-preserving key (memcpy for bit access)
+// so the radix and counting logic stay uniform and branch-free, and one engine
+// serves u32 / i32 / u64 / i64 / float / double.
 // ==========================================================================
 #include "sluice.h"
 
 #include <algorithm>   // std::sort, std::copy
+#include <atomic>      // parallel bucket work-stealing
 #include <chrono>      // stats timing
 #include <cstring>     // std::memcpy
 #include <new>         // std::bad_alloc
+#include <thread>      // parallel radix workers
 #include <vector>
 
 namespace {
@@ -40,6 +50,8 @@ struct Thresholds {
     int      interp_skew    = INTERP_SKEW;
     uint64_t counting_load  = COUNTING_LOAD;
     uint64_t counting_cap   = COUNTING_CAP;
+    int      max_threads    = 1;         // 0/1 = sequential
+    size_t   parallel_min   = 262144;    // only parallelize radix when n >= this
 };
 
 
@@ -179,21 +191,95 @@ void radix(U* a, size_t n) {
     if (src != a) std::memcpy(a, src, n * sizeof(U));  // even passes end in a
 }
 
+// LSD radix over the LOW sizeof(U)-1 bytes only (top byte assumed constant).
+// Used to finish each MSD bucket, where every key shares the same top byte.
+template <class U>
+void radix_lower(U* a, size_t n) {
+    if (n < 2) return;
+    std::vector<U> buf(n);
+    U* src = a; U* dst = buf.data();
+    constexpr int passes = static_cast<int>(sizeof(U)) - 1;
+    for (int p = 0; p < passes; ++p) {
+        const int shift = p * 8;
+        size_t count[256] = {0};
+        for (size_t i = 0; i < n; ++i) ++count[(static_cast<uint64_t>(src[i]) >> shift) & 0xFFu];
+        size_t sum = 0;
+        for (int b = 0; b < 256; ++b) { size_t c = count[b]; count[b] = sum; sum += c; }
+        for (size_t i = 0; i < n; ++i)
+            dst[count[(static_cast<uint64_t>(src[i]) >> shift) & 0xFFu]++] = src[i];
+        std::swap(src, dst);
+    }
+    if (src != a) std::memcpy(a, src, n * sizeof(U));
+}
+
+// Parallel most-significant-digit radix. One pass partitions by the top byte
+// into 256 contiguous, independent buckets (concatenated in order they are
+// already globally sorted — no merge). Worker threads then finish each bucket
+// on its lower bytes via radix_lower, pulling buckets from a shared atomic
+// counter for dynamic load balancing (handles skew). Result is identical to the
+// sequential radix. Returns the number of worker threads used, or 0 on OOM
+// (caller then falls back to sequential radix).
+template <class U>
+int parallel_radix(U* a, size_t n, int want_threads) {
+    constexpr int TOPSHIFT = (static_cast<int>(sizeof(U)) - 1) * 8;
+    std::vector<U> buf;
+    try { buf.resize(n); } catch (const std::bad_alloc&) { return 0; }
+
+    size_t off[257];
+    {
+        size_t hist[256] = {0};
+        for (size_t i = 0; i < n; ++i) ++hist[(static_cast<uint64_t>(a[i]) >> TOPSHIFT) & 0xFFu];
+        size_t sum = 0;
+        for (int b = 0; b < 256; ++b) { off[b] = sum; sum += hist[b]; }
+        off[256] = sum;
+    }
+    {
+        size_t cur[256];
+        for (int b = 0; b < 256; ++b) cur[b] = off[b];
+        for (size_t i = 0; i < n; ++i) {
+            int b = static_cast<int>((static_cast<uint64_t>(a[i]) >> TOPSHIFT) & 0xFFu);
+            buf[cur[b]++] = a[i];
+        }
+    }
+
+    int nthreads = want_threads;
+    if (nthreads > 256) nthreads = 256;
+    if (nthreads < 1)   nthreads = 1;
+
+    std::atomic<int> next_bucket{0};
+    auto worker = [&]() {
+        for (;;) {
+            int b = next_bucket.fetch_add(1, std::memory_order_relaxed);
+            if (b >= 256) break;
+            size_t start = off[b], len = off[b + 1] - off[b];
+            if (len > 1) radix_lower(buf.data() + start, len);
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(nthreads - 1));
+    for (int t = 1; t < nthreads; ++t) pool.emplace_back(worker);
+    worker();                                   // the calling thread is a worker too
+    for (auto& th : pool) th.join();
+
+    std::memcpy(a, buf.data(), n * sizeof(U));
+    return nthreads;
+}
+
 // --- the dispatcher -----------------------------------------------------
-// Optional out-parameter: when non-null, records which path actually ran and
-// how many radix passes it used. Left null on the fast path (no overhead).
-struct core_path { const char* algorithm; int passes; };
+// Optional out-parameter: when non-null, records which path actually ran, how
+// many radix passes, and how many threads. Left null on the fast path.
+struct core_path { const char* algorithm; int passes; int threads; };
 
 template <class U>
 void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th = Thresholds{}) {
-    auto note = [&](const char* alg, int passes) { if (path) { path->algorithm = alg; path->passes = passes; } };
-    note("insertion", 0);
+    auto note = [&](const char* alg, int passes, int threads) { if (path) { path->algorithm = alg; path->passes = passes; path->threads = threads; } };
+    note("insertion", 0, 1);
     if (n < 2) return;
     if (n < th.insertion_max) { insertion(a, n); return; }
     // small arrays: the interpolation placement sort wins here. If it detects
     // skew it returns false and we fall through to radix (n is small, so the
     // radix allocation is tiny).
-    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew)) { note("interpolation", 0); return; }
+    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew)) { note("interpolation", 0, 1); return; }
 
     // one scan: min, max, and "already sorted?" — cheap, high-value.
     U mn = a[0], mx = a[0];
@@ -204,18 +290,23 @@ void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th
         if (x < mn) mn = x;
         else if (x > mx) mx = x;
     }
-    if (sorted) { note("already sorted", 0); return; }
+    if (sorted) { note("already sorted", 0, 1); return; }
 
     const uint64_t range = static_cast<uint64_t>(mx) - static_cast<uint64_t>(mn);
 
     // bounded range -> counting sort (pure O(n), no comparisons)
     if (range < th.counting_cap && range <= th.counting_load * static_cast<uint64_t>(n)) {
-        try { counting(a, n, mn, range); note("counting", 0); return; }
+        try { counting(a, n, mn, range); note("counting", 0, 1); return; }
         catch (const std::bad_alloc&) { /* fall through */ }
     }
-    // general integers -> radix; std::sort is the in-place safety net
-    try { radix(a, n); note("radix", static_cast<int>(sizeof(U))); return; }
-    catch (const std::bad_alloc&) { std::sort(a, a + n); note("std::sort", 0); }
+    // general integers -> radix; parallel MSD radix when configured and large.
+    try {
+        if (th.max_threads > 1 && n >= th.parallel_min) {
+            int used = parallel_radix(a, n, th.max_threads);
+            if (used > 0) { note("radix", static_cast<int>(sizeof(U)), used); return; }
+        }
+        radix(a, n); note("radix", static_cast<int>(sizeof(U)), 1); return;
+    } catch (const std::bad_alloc&) { std::sort(a, a + n); note("std::sort", 0, 1); }
 }
 
 // map signed <-> unsigned preserving order by flipping the sign bit
@@ -260,7 +351,7 @@ sluice_status run(T* data, size_t n, ptrdiff_t select, sluice_order order,
                   sluice_stats* st, const Thresholds& th, Domain dom) {
     if (st) { st->algorithm = "none"; st->time_ms = 0.0; st->memory_bytes = 0;
               st->passes = 0; st->already_sorted = 1; st->duplicate_pct = 0.0;
-              st->range = 0.0; st->n = n; }
+              st->range = 0.0; st->n = n; st->threads_used = 1; }
     auto apply_select = [&]() {
         if (select < 0) { size_t k = static_cast<size_t>(-select); if (k > n) k = n;
             if (k && k < n) std::memmove(data, data + (n - k), k * sizeof(T)); }
@@ -285,7 +376,7 @@ sluice_status run(T* data, size_t n, ptrdiff_t select, sluice_order order,
         if (st) { if (k < keys[i - 1]) sorted = false; if (k < mn) mn = k; else if (k > mx) mx = k; }
     }
 
-    core_path path{ "insertion", 0 };
+    core_path path{ "insertion", 0, 1 };
     if (st) {
         st->already_sorted = sorted ? 1 : 0;
         st->range = static_cast<double>(mx) - static_cast<double>(mn);
@@ -295,6 +386,7 @@ sluice_status run(T* data, size_t n, ptrdiff_t select, sluice_order order,
         st->time_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count();
         st->algorithm = path.algorithm;
         st->passes    = path.passes;
+        st->threads_used = path.threads;
         size_t distinct = 1;
         for (size_t i = 1; i < n; ++i) if (keys[i] != keys[i - 1]) ++distinct;
         st->duplicate_pct = 100.0 * (1.0 - static_cast<double>(distinct) / static_cast<double>(n));
@@ -454,6 +546,8 @@ SLUICE_API void sluice_config_init(sluice_config* cfg) {
     cfg->interpolation_skew  = d.interp_skew;
     cfg->counting_load       = d.counting_load;
     cfg->counting_cap        = d.counting_cap;
+    cfg->max_threads         = d.max_threads;   // 1 = sequential
+    cfg->parallel_min        = d.parallel_min;
 }
 
 SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
@@ -487,6 +581,8 @@ SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
         if (cfg->interpolation_skew)  th.interp_skew   = cfg->interpolation_skew;
         if (cfg->counting_load)       th.counting_load = cfg->counting_load;
         if (cfg->counting_cap)        th.counting_cap  = cfg->counting_cap;
+        if (cfg->max_threads > 1)     th.max_threads   = cfg->max_threads;   // 0/1 = sequential
+        if (cfg->parallel_min)        th.parallel_min  = cfg->parallel_min;
     }
     sluice_stats* st = collect_stats ? stats : nullptr;
     switch (type) {
@@ -506,6 +602,6 @@ SLUICE_API int sluice_is_sorted_u32(const uint32_t* data, size_t n) {
     return 1;
 }
 
-SLUICE_API const char* sluice_version(void) { return "sluice 0.1.0"; }
+SLUICE_API const char* sluice_version(void) { return "sluice 0.4.0"; }
 
 }  // extern "C"

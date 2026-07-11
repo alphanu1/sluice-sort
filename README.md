@@ -3,6 +3,8 @@
 **An adaptive numeric sorting engine that routes every dataset through its
 fastest available sorting strategy.**
 
+*Version 0.4.0*
+
 Just as a sluice channels a mixed stream and separates it into graded outputs by
 routing it through the right screen, this engine inspects the input and
 **dispatches to the fastest applicable method** — so it is never meaningfully
@@ -170,11 +172,13 @@ make sanitize   # build with ASan+UBSan (incl. float-cast-overflow), run self-te
 make strict     # compile under -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror
 ```
 
-The self-test fuzzes against `std::sort` across u32/i32/u64, every dispatch
-boundary (15/16/17, 31/32/33, 511/512/513, 999/1000/1001, 100k, 1M), six input
-shapes (random, bounded, duplicate-heavy, nearly-sorted, reverse-sorted,
-all-equal), and adversarial 64-bit magnitudes (values near 2⁵³/2⁶³/UINT64_MAX
-and INT64_MIN/MAX). It is clean under ASan+UBSan and the strict warning set.
+The self-test fuzzes against `std::sort` across every type (u32/i32/u64/i64,
+`float`, `double`), every dispatch boundary (15/16/17, 31/32/33, 511/512/513,
+999/1000/1001, 100k, 1M), six input shapes (random, bounded, duplicate-heavy,
+nearly-sorted, reverse-sorted, all-equal), adversarial 64-bit magnitudes (near
+2⁵³/2⁶³/UINT64_MAX, INT64_MIN/MAX), NaN handling, the first/top selectors, the
+unified dispatcher and its stats, custom configs, and the parallel path. It is
+clean under ASan+UBSan, ThreadSanitizer, and the strict warning set.
 
 Artifacts land in `build/<target>/`:
 
@@ -321,12 +325,35 @@ Unsupported element types are a compile error, not a runtime check.
 #include "sluice.hpp"
 std::vector<double> v = { 3.14, -2.5, 0.0, -1.0, 2.71 };
 
-sluice::sort(v);            // ascending
+// sort — ascending by default, or pass a direction
+sluice::sort(v);                          // ascending
+sluice::sort(v, SLUICE_DESCENDING);
+sluice::ascending(v);                     // explicit shorthands
 sluice::descending(v);
-sluice::first(v, 20);       // 20 smallest, moved to the front
-sluice::top(v, 20);         // 20 largest, moved to the front
-sluice::sort(ptr, n);       // raw pointer + size also works
+
+// selection — first N (head) / top N (tail); direction optional
+sluice::first(v, 20);                     // 20 smallest, moved to the front
+sluice::top(v, 20);                       // 20 largest, moved to the front
+sluice::first(v, 20, SLUICE_DESCENDING);  // direction picks which end
+sluice::top(v, 20, SLUICE_DESCENDING);
+
+// every verb also has a raw pointer + size overload
+sluice::sort(v.data(), v.size());
+sluice::ascending(v.data(), v.size());
+sluice::first(v.data(), v.size(), 20);
+sluice::top(v.data(), v.size(), 20);
+
+// profiling and custom tuning (route through the unified dispatcher)
+sluice_stats  st;    sluice::sort(v, st);        // fill stats
+sluice_config cfg{}; sluice::sort(v, cfg);       // custom thresholds
+sluice::sort(v, cfg, st);                        // both
 ```
+
+`first`/`top` return the count kept (`min(k, n)`); the `stats`/`cfg` forms of
+`sort` return a `sluice_status`. A trailing `sluice_order` argument is accepted
+on all of them (e.g. `sluice::sort(v, st, SLUICE_DESCENDING)`). The `stats`/`cfg`
+overloads currently exist on `sort` only — `ascending`/`descending`/`first`/`top`
+are plain convenience forms.
 
 ### One call over any type + profiling
 
@@ -338,7 +365,7 @@ memory, radix passes, already-sorted, duplicate %, value range).
 
 ```c
 sluice_stats st;
-sluice_sort(SLUICE_U32, data, n, /*select=*/0, /*order=*/NULL, /*stats=*/1, &st);
+sluice_sort(SLUICE_U32, data, n, /*select=*/0, /*order=*/NULL, /*collect_stats=*/1, &st, /*cfg=*/NULL);
 // st.algorithm -> "counting", st.duplicate_pct -> 99.0, st.range -> 999, ...
 ```
 
@@ -364,11 +391,38 @@ sluice::sort(v, cfg);           // C++ wrapper; sluice::sort(v, cfg, stats) too
 ```
 
 Fields: `insertion_limit`, `interpolation_limit`, `interpolation_skew`,
-`counting_load`, `counting_cap`. Supplying a config routes through the general
-engine rather than the in-place specialized path (a small cost), so it's for
-tuning and profiling, not the hot path. `interpolation_limit` is clamped to an
-internal ceiling (4096); values above the default 512 use heap scratch instead
-of the stack.
+`counting_load`, `counting_cap`, plus the parallel knobs below. Supplying a
+config routes through the general engine rather than the in-place specialized
+path (a small cost), so it's for tuning and profiling, not the hot path.
+`interpolation_limit` is clamped to an internal ceiling (4096); values above the
+default 512 use heap scratch instead of the stack.
+
+### Parallel sorting
+
+On large arrays the radix path can be split across cores. Set `max_threads` to
+opt in; `0` or `1` means sequential (the default), so nothing runs on threads
+unless you ask. Parallelism only engages when the sort actually reaches the
+radix path *and* `n >= parallel_min` (default 262144).
+
+```c
+sluice_config cfg = {0};
+cfg.max_threads  = 8;        /* use up to 8 worker threads    */
+cfg.parallel_min = 500000;   /* ...but only for n >= 500k      */
+sluice_sort(SLUICE_U32, data, n, 0, NULL, 1, &stats, &cfg);
+/* stats.threads_used reports how many were used */
+```
+
+The scheme is a most-significant-digit split: one pass partitions by the top
+byte into 256 independent buckets (concatenated in order they're already
+globally sorted — no merge step), then worker threads finish each bucket on its
+lower bytes, pulling buckets from a shared atomic counter for load balancing.
+The result is **identical** to the sequential sort. It's verified equal to
+`std::sort` across thread counts and skewed distributions, and the path is clean
+under ThreadSanitizer.
+
+> Speedup depends on core count and memory bandwidth; integer sorting
+> parallelizes well but is partly bandwidth-bound, so expect meaningful gains at
+> large n on many-core machines rather than perfect linear scaling.
 
 ## API
 
@@ -415,6 +469,7 @@ typedef struct {
     double      duplicate_pct;  /* 100 * (1 - distinct/n) */
     double      range;          /* span of the sorted key domain */
     size_t      n;
+    int         threads_used;   /* worker threads used (1 = sequential) */
 } sluice_stats;
 /* select: >0 first N, <0 top |N|, 0 all.  order: NULL = ascending.
    collect_stats: 0 = fast path, 1 = fill stats (must be non-NULL).
@@ -425,6 +480,8 @@ typedef struct {
     int      interpolation_skew;   /* interp skew bail            (default 32)      */
     uint64_t counting_load;        /* counting if range <= load*n (default 4)       */
     uint64_t counting_cap;         /* ...and range < cap          (default 2097152) */
+    int      max_threads;          /* parallel radix; 0/1 = sequential (default)    */
+    size_t   parallel_min;         /* parallelize only when n >= this (default 262144) */
 } sluice_config;
 void          sluice_config_init(sluice_config* cfg);
 sluice_status sluice_sort(sluice_dtype type, void* data, size_t n, ptrdiff_t select,

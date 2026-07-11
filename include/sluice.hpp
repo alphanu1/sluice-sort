@@ -1,6 +1,9 @@
 /* ==========================================================================
  * sluice.hpp — header-only C++ wrapper over the Sluice C ABI.
  *
+ * Author: Alphanu1 / Ben Templaman
+ * Since:  2026-07-08
+ *
  * Type-safe and size-deduced: element type and length come from the container
  * (or an explicit pointer+size), and each call dispatches at COMPILE TIME to
  * the matching specialized C function — so there is no runtime type switch and

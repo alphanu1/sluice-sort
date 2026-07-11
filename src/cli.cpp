@@ -1,4 +1,8 @@
 // Sluice command-line tool: correctness self-test + benchmark vs std::sort.
+//
+// Author: Alphanu1 / Ben Templaman
+// Since:  2026-07-08
+//
 //   sluice                      run self-test, then benchmark
 //   sluice --test               run self-test only  (exit 1 on failure)
 //   sluice --bench              run benchmark only
@@ -272,7 +276,7 @@ static bool self_test() {
             size_t n = r() % 3000;
             std::vector<uint32_t> a(n); for (auto& x : a) x = r();
             std::vector<uint32_t> g(a); std::sort(g.begin(), g.end());
-            sluice_config cfg = {0,0,0,0,0};
+            sluice_config cfg{};
             cfg.interpolation_limit = 768;   // raised past the default 512 (heap scratch)
             cfg.counting_load = 8;
             if (sluice_sort(SLUICE_U32, a.data(), n, 0, nullptr, 0, nullptr, &cfg) != SLUICE_OK || a != g) {
@@ -281,7 +285,7 @@ static bool self_test() {
         // a raised interpolation_limit should actually route n=700 to interpolation
         {
             std::vector<uint32_t> a(700); for (auto& x : a) x = r();
-            sluice_config cfg = {0,0,0,0,0}; cfg.interpolation_limit = 1024;
+            sluice_config cfg{}; cfg.interpolation_limit = 1024;
             sluice_stats s;
             sluice_sort(SLUICE_U32, a.data(), a.size(), 0, nullptr, 1, &s, &cfg);
             if (std::strcmp(s.algorithm, "interpolation") != 0) { std::printf("  config interp route FAIL (%s)\n", s.algorithm); return false; }
@@ -290,10 +294,50 @@ static bool self_test() {
         {
             std::vector<uint32_t> a(50000); std::mt19937 rr(5); for (auto& x : a) x = rr() % 5000;
             std::vector<uint32_t> g(a); std::sort(g.begin(), g.end());
-            sluice_config cfg = {0,0,0,0,0}; cfg.counting_cap = 1u << 10;  // tiny cap -> forces radix
+            sluice_config cfg{}; cfg.counting_cap = 1u << 10;  // tiny cap -> forces radix
             sluice_stats s;
             sluice_sort(SLUICE_U32, a.data(), a.size(), 0, nullptr, 1, &s, &cfg);
             if (a != g || std::strcmp(s.algorithm, "radix") != 0) { std::printf("  config cap FAIL (%s)\n", s.algorithm); return false; }
+        }
+    }
+
+    // --- parallel radix: result must equal the sequential sort -----------
+    {
+        std::mt19937_64 r(2025);
+        // sizes above and around a lowered parallel_min, several thread counts,
+        // several distributions; each must match std::sort exactly.
+        for (int threads : {2, 3, 4, 8}) {
+            for (int shape = 0; shape < 4; ++shape) {
+                size_t n = 300000 + (r() % 200000);
+                std::vector<uint64_t> a(n);
+                for (size_t i = 0; i < n; ++i) {
+                    switch (shape) {
+                        case 0: a[i] = r(); break;                 // full range
+                        case 1: a[i] = r() % 1000000; break;       // moderate range
+                        case 2: a[i] = r() % 16; break;            // heavy dup (skewed buckets)
+                        default: a[i] = (r() & 0xFFull) << 56;     // only top byte varies (bucket skew)
+                    }
+                }
+                std::vector<uint64_t> g(a); std::sort(g.begin(), g.end());
+                sluice_config cfg{}; cfg.max_threads = threads; cfg.parallel_min = 200000;
+                cfg.counting_cap = 1;  // force the radix path so parallel actually engages
+                sluice_stats s;
+                sluice_sort(SLUICE_U64, a.data(), n, 0, nullptr, 1, &s, &cfg);
+                if (a != g) { std::printf("  parallel u64 FAIL threads=%d shape=%d n=%zu\n", threads, shape, n); return false; }
+                if (std::strcmp(s.algorithm, "radix") == 0 && s.threads_used != threads) {
+                    std::printf("  parallel threads_used=%d expected=%d\n", s.threads_used, threads); return false;
+                }
+            }
+        }
+        // parallel + descending + top-N still correct
+        {
+            size_t n = 400000; std::vector<int32_t> a(n);
+            for (auto& x : a) x = static_cast<int32_t>(r());
+            std::vector<int32_t> g(a); std::sort(g.begin(), g.end(), std::greater<int32_t>());
+            sluice_config cfg{}; cfg.max_threads = 4; cfg.parallel_min = 100000;
+            sluice_order desc = SLUICE_DESCENDING;
+            sluice_sort(SLUICE_I32, a.data(), n, 0, &desc, 0, nullptr, &cfg);
+            if (a != g) { std::printf("  parallel desc FAIL\n"); return false; }
         }
     }
     return true;

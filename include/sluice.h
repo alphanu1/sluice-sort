@@ -2,6 +2,9 @@
  * Sluice — an adaptive numeric sorting engine that routes every dataset
  * through its fastest available sorting strategy.
  *
+ * Author: Alphanu1 / Ben Templaman
+ * Since:  2026-07-08
+ *
  * A "sluice" channels a mixed stream and separates it into graded outputs by
  * routing it through the right screen. This engine does the same: it inspects
  * the input and dispatches to the fastest applicable method —
@@ -125,6 +128,7 @@ typedef struct {
     double      duplicate_pct;  /* 100 * (1 - distinct/n) */
     double      range;          /* span of the sorted key domain (= value span for integers) */
     size_t      n;              /* element count */
+    int         threads_used;   /* worker threads used (1 = sequential) */
 } sluice_stats;
 
 /* Dispatch tuning. Optimal thresholds vary by CPU; override any you like.
@@ -138,6 +142,8 @@ typedef struct {
     int      interpolation_skew;   /* interp bucket-skew bail      (default 32)      */
     uint64_t counting_load;        /* counting if range <= load*n  (default 4)       */
     uint64_t counting_cap;         /* ...and range < cap           (default 2097152) */
+    int      max_threads;          /* parallel radix on large n; 0/1 = sequential    */
+    size_t   parallel_min;         /* only parallelize when n >= this (default 262144)*/
 } sluice_config;
 
 /* Fill cfg with the default thresholds. */
@@ -159,7 +165,7 @@ SLUICE_API sluice_status sluice_sort(sluice_dtype type, void* data, size_t n,
  * Provided because "is it already sorted?" is a cheap, common query. */
 SLUICE_API int  sluice_is_sorted_u32(const uint32_t* data, size_t n);
 
-/* Library version, e.g. "sluice 0.1.0". */
+/* Library version, e.g. "sluice 0.4.0". */
 SLUICE_API const char* sluice_version(void);
 
 #ifdef __cplusplus

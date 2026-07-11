@@ -48,7 +48,7 @@ SHARED_LIB := $(BUILD)/lib$(NAME)$(SO_EXT)
 OBJ_SHARED := $(BUILD)/sluice.shared.o
 OBJ_STATIC := $(BUILD)/sluice.static.o
 
-COMMON_CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -I$(INC_DIR) $(CXXFLAGS)
+COMMON_CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -pthread -I$(INC_DIR) $(CXXFLAGS)
 
 # ---- per-target toolchain, extensions, and flags ---------------------------
 # Each block sets TARGET_CXX (the *default* compiler for that target) plus the
@@ -127,7 +127,7 @@ $(OBJ_SHARED): $(LIB_SRC) $(INC_DIR)/sluice.h | $(BUILD)
 	$(CXX) $(COMMON_CXXFLAGS) $(FPIC) $(VIS) -DSLUICE_BUILD_SHARED -c $(LIB_SRC) -o $@
 
 $(SHARED_LIB): $(OBJ_SHARED)
-	$(CXX) $(FPIC) $(SHARED_LDFLAGS) $^ -o $@
+	$(CXX) $(FPIC) -pthread $(SHARED_LDFLAGS) $^ -o $@
 
 # --- executable (statically linked against the engine object) ---------------
 $(EXE): $(CLI_SRC) $(OBJ_STATIC) $(INC_DIR)/sluice.h | $(BUILD)
@@ -145,16 +145,16 @@ bench: exe
 sanitize:
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined,float-cast-overflow \
-	  -fno-sanitize-recover=all -I$(INC_DIR) $(LIB_SRC) $(CLI_SRC) -o $(BUILD)/$(NAME)-san
+	  -fno-sanitize-recover=all -pthread -I$(INC_DIR) $(LIB_SRC) $(CLI_SRC) -o $(BUILD)/$(NAME)-san
 	@$(BUILD)/$(NAME)-san --test
 
 # Compile the library under strict warnings; fails the build on any warning.
 strict:
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror \
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror -pthread \
 	  -I$(INC_DIR) -c $(LIB_SRC) -o $(BUILD)/sluice.strict.o
 	@printf '#include "sluice.hpp"\nint main(){return 0;}\n' > $(BUILD)/hpp_check.cpp
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror \
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wconversion -Wstrict-aliasing=2 -Werror -pthread \
 	  -I$(INC_DIR) -c $(BUILD)/hpp_check.cpp -o $(BUILD)/hpp_check.o
 	@echo "strict: no warnings (library + C++ header)"
 
