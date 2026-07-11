@@ -1,12 +1,13 @@
 # Sluice
 
-**An adaptive integer sorting engine that routes every dataset through its
+**An adaptive numeric sorting engine that routes every dataset through its
 fastest available sorting strategy.**
 
 Just as a sluice channels a mixed stream and separates it into graded outputs by
 routing it through the right screen, this engine inspects the input and
 **dispatches to the fastest applicable method** — so it is never meaningfully
-slower than `std::sort` and often several times faster.
+slower than `std::sort` and often several times faster. It sorts 32- and 64-bit
+integers (signed or unsigned) and `float`/`double`.
 
 ```
 tiny arrays (n < 16)       -> insertion sort       (no setup cost)
@@ -19,7 +20,9 @@ allocation failure         -> std::sort             (in-place safety net)
 
 Non-comparison methods (interpolation, counting, radix) sidestep the
 Ω(n·log n) lower bound that binds every comparison sort, which is why they win
-on integer data. The interpolation path (Flashsort, Neubert 1998 — see
+on fixed-width numeric keys — integers directly, and `float`/`double` via an
+order-preserving IEEE-754 transform that maps them to sortable unsigned keys.
+The interpolation path (Flashsort, Neubert 1998 — see
 [References](#references)) computes each element's approximate position
 directly and repairs locally; its O(n²) worst case is defused by
 capping it to n <= 512 plus a skew guard that hands off to radix the moment
@@ -95,8 +98,8 @@ earlier version of this chart accidentally compiled the reference radix with
 
 ### Interpolation vs radix in the n ≤ 512 band
 
-The small-array band dispatches to interpolation rather than radix (the general
-integer path). This is why — interpolation's gain over radix across that band,
+The small-array band dispatches to interpolation rather than radix (the general-
+purpose path). This is why — interpolation's gain over radix across that band,
 uniform random uint32:
 
 | n   | interpolation | radix   | interp gain |
@@ -116,12 +119,18 @@ crossover, beyond which radix wins and the dispatcher switches to it.
 
 ## Scope & caveats
 
-- **Integer keys only:** `uint32/int32/uint64/int64`. Radix needs fixed-width
-  decomposable keys; this is the deliberate trade — specialization for speed.
-  `std::sort` remains the right tool for arbitrary comparables.
-- Signed types are mapped to the unsigned domain (sign-bit flip) and back.- Uses ~n auxiliary memory (radix) or O(range) (counting); `std::sort` is
-  in-place. The `std::sort` fallback covers allocation failure.
-- Equal integers are indistinguishable, so results are stable by construction.
+- **Fixed-width numeric keys:** `uint32/int32/uint64/int64`, plus `float` and
+  `double`. Radix needs fixed-width decomposable keys; this is the deliberate
+  trade — specialization for speed. `std::sort` remains the right tool for
+  arbitrary comparables.
+- Signed integers map to the unsigned domain by flipping the sign bit; floats
+  map to order-preserving unsigned keys via the IEEE-754 transform (memcpy for
+  bit access, so no aliasing violation). Float ordering is a total order
+  (-inf < -0 < +0 < +inf, NaNs by bit pattern) — well-defined even for NaN,
+  unlike `std::sort`.
+- Uses ~n auxiliary memory (radix, and the float key buffer) or O(range)
+  (counting); `std::sort` is in-place and is the fallback on allocation failure.
+- Equal keys are indistinguishable, so results are stable by construction.
 - Not novel research: this is a well-engineered combination of established
   algorithms, dispatched adaptively — the same family as `boost::spreadsort`
   and `ska_sort`. The interpolation path is **Flashsort** (Neubert, 1998); the
@@ -251,6 +260,9 @@ first K of the sorted result (its head), `--top K` keeps the last K (its tail).
 Non-integer arguments are skipped with a warning; an empty list prints usage;
 `K > n` returns everything and `K = 0` prints nothing.
 
+(The CLI parses integer arguments only; `float`/`double` sorting is available
+through the library API — see below.)
+
 ```
 $ sluice 1 6 4 9 2               # sort ascending (default)
 1 2 4 6 9
@@ -280,6 +292,9 @@ C / C++:
 uint32_t data[] = { 9, 1, 8, 2, 7 };
 sluice_sort_u32(data, 5);                              // ascending -> 1 2 7 8 9
 sluice_sort_u32_ordered(data, 5, SLUICE_DESCENDING);   // -> 9 8 7 2 1
+
+double vals[] = { 3.14, -2.5, 0.0, -1.0, 2.71 };
+sluice_sort_f64(vals, 5);                              // -> -2.5 -1 0 2.71 3.14
 ```
 
 Link statically: `cc app.c libsluice.a -lstdc++`
@@ -305,12 +320,16 @@ void        sluice_sort_u32(uint32_t* data, size_t n);
 void        sluice_sort_i32(int32_t*  data, size_t n);
 void        sluice_sort_u64(uint64_t* data, size_t n);
 void        sluice_sort_i64(int64_t*  data, size_t n);
+void        sluice_sort_f32(float*  data, size_t n);
+void        sluice_sort_f64(double* data, size_t n);
 
 /* direction-aware forms */
 void        sluice_sort_u32_ordered(uint32_t* data, size_t n, sluice_order order);
 void        sluice_sort_i32_ordered(int32_t*  data, size_t n, sluice_order order);
 void        sluice_sort_u64_ordered(uint64_t* data, size_t n, sluice_order order);
 void        sluice_sort_i64_ordered(int64_t*  data, size_t n, sluice_order order);
+void        sluice_sort_f32_ordered(float*  data, size_t n, sluice_order order);
+void        sluice_sort_f64_ordered(double* data, size_t n, sluice_order order);
 
 /* head/tail of the array sorted in `order`: first_n keeps the first k, top_n
    keeps the last k (moved to the front). Return min(k, n). */
