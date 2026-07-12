@@ -197,3 +197,106 @@ jobs:
           name: sluice-windows
           path: build/windows/
           if-no-files-found: error
+
+  release:
+    name: Compile & release
+    needs: [linux, linux-arm, sanitizers, macos, windows]
+    # Only from main (real pushes) or a manual run — never from PRs/forks.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed to create the tag + release
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make zip
+
+      - name: Compile (native Linux)
+        run: make clean all TARGET=linux CXX=g++
+
+      - name: Determine version and whether it is already released
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(./build/linux/sluice --version | sed 's/^sluice //')"
+          tag="v$(printf '%s' "$version" | tr ' ' '-')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — version unchanged; nothing to release."
+            echo "create=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version $version -> will create release $tag."
+            echo "create=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download platform build artifacts
+        if: steps.ver.outputs.create == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets
+        if: steps.ver.outputs.create == 'true'
+        run: |
+          set -euo pipefail
+          slug="$(printf '%s' '${{ steps.ver.outputs.version }}' | tr ' ' '-')"
+          mkdir -p dist
+          bundle() {   # <src-dir> <platform-label> <tar|zip>
+            src="$1"; plat="$2"; kind="$3"
+            [ -d "$src" ] || { echo "skip $plat (no artifact at $src)"; return 0; }
+            stage="sluice-${slug}-${plat}"
+            rm -rf "$stage"; mkdir -p "$stage"
+            cp -r "$src"/. "$stage"/
+            cp include/sluice.h include/sluice.hpp README.md "$stage"/
+            if [ "$kind" = zip ]; then zip -qr "dist/${stage}.zip" "$stage"
+            else tar -czf "dist/${stage}.tar.gz" "$stage"; fi
+          }
+          bundle build/linux                  linux-x86_64 tar
+          bundle artifacts/sluice-linux-arm64 linux-arm64  tar
+          bundle artifacts/sluice-macos       macos        tar
+          bundle artifacts/sluice-windows     windows      zip
+          cp docs/methods.svg "dist/sluice-${slug}-benchmark.svg"
+          ls -la dist
+
+      - name: Generate release notes (description + benchmark)
+        if: steps.ver.outputs.create == 'true'
+        run: |
+          {
+            # Description: the README intro (everything above the first "## "),
+            # dropping the redundant version line.
+            awk 'NR>1 && /^## /{exit} NR>1{print}' README.md | grep -v '^\*Version'
+            echo
+            echo '## Benchmark'
+            echo
+            echo 'Measured on the GitHub-hosted runner for this release (pool of'
+            echo 'distinct arrays per size; shared hardware, so trust the ratios):'
+            echo
+            echo '```'
+            ./build/linux/sluice --bench
+            echo '```'
+            echo
+            echo 'Full methodology, the seven-method chart, and the API reference are in the README.'
+          } > notes.md
+          echo '----- notes.md -----'; cat notes.md
+
+      - name: Create release
+        if: steps.ver.outputs.create == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --target "${{ github.sha }}" \
+            --title "sluice ${{ steps.ver.outputs.version }}" \
+            --notes-file notes.md \
+            dist/*
