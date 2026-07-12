@@ -45,7 +45,7 @@ static bool self_test() {
     };
     // sizes straddling every dispatch threshold, ranges hitting every path
     for (int t = 0; t < 2000; ++t) {
-        std::uniform_int_distribution<int> nd(0, 400);
+        std::uniform_int_distribution<size_t> nd(0, 400);
         size_t n = nd(rng);
         uint32_t hi = (rng() & 3) == 0 ? 7u                       // dup-heavy
                     : (rng() & 1)      ? 100000u                   // counting
@@ -59,7 +59,7 @@ static bool self_test() {
     }
     // signed correctness (negatives must order below positives)
     for (int t = 0; t < 1000; ++t) {
-        std::uniform_int_distribution<int> nd(0, 400);
+        std::uniform_int_distribution<size_t> nd(0, 400);
         size_t n = nd(rng);
         std::uniform_int_distribution<int32_t> vd(-1000000, 1000000);
         std::vector<int32_t> a(n);
@@ -71,7 +71,7 @@ static bool self_test() {
     }
     // 64-bit
     for (int t = 0; t < 500; ++t) {
-        std::uniform_int_distribution<int> nd(0, 400);
+        std::uniform_int_distribution<size_t> nd(0, 400);
         size_t n = nd(rng);
         std::uniform_int_distribution<uint64_t> vd(0, ~0ull);
         std::vector<uint64_t> a(n);
@@ -83,7 +83,7 @@ static bool self_test() {
     }
     // descending: must equal the reverse of the ascending result
     for (int t = 0; t < 500; ++t) {
-        std::uniform_int_distribution<int> nd(0, 400);
+        std::uniform_int_distribution<size_t> nd(0, 400);
         size_t n = nd(rng);
         std::uniform_int_distribution<int32_t> vd(-1000000, 1000000);
         std::vector<int32_t> a(n), gold(n);
@@ -95,7 +95,7 @@ static bool self_test() {
     }
     // first_n = head, top_n = tail, of the array sorted in `order`
     for (int t = 0; t < 500; ++t) {
-        std::uniform_int_distribution<int> nd(1, 400);
+        std::uniform_int_distribution<size_t> nd(1, 400);
         size_t n = nd(rng);
         size_t k = std::uniform_int_distribution<size_t>(0, n + 5)(rng);  // incl. k>n
         size_t kk = std::min(k, n);
@@ -109,12 +109,12 @@ static bool self_test() {
 
         std::vector<int32_t> af(a);
         size_t wf = sluice_first_n_i32(af.data(), n, k, ord);
-        if (wf != kk || !std::equal(s.begin(), s.begin() + kk, af.begin())) {
+        if (wf != kk || !std::equal(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(kk), af.begin())) {
             std::printf("  first_n FAIL n=%zu k=%zu\n", n, k); return false;
         }
         std::vector<int32_t> at(a);
         size_t wt = sluice_top_n_i32(at.data(), n, k, ord);
-        if (wt != kk || !std::equal(s.end() - kk, s.end(), at.begin())) {  // tail kk
+        if (wt != kk || !std::equal(s.end() - static_cast<std::ptrdiff_t>(kk), s.end(), at.begin())) {  // tail kk
             std::printf("  top_n FAIL n=%zu k=%zu\n", n, k); return false;
         }
     }
@@ -231,11 +231,11 @@ static bool self_test() {
             std::vector<int32_t> f(base);
             sluice_order asc = SLUICE_ASCENDING;
             sluice_sort(SLUICE_I32, f.data(), n, static_cast<ptrdiff_t>(k), &asc, 0, nullptr, nullptr);
-            if (!std::equal(g.begin(), g.begin() + std::min(k,n), f.begin())) { std::printf("  unified first FAIL\n"); return false; }
+            if (!std::equal(g.begin(), g.begin() + static_cast<std::ptrdiff_t>(std::min(k,n)), f.begin())) { std::printf("  unified first FAIL\n"); return false; }
             // top k via select<0
             std::vector<int32_t> tp(base);
             sluice_sort(SLUICE_I32, tp.data(), n, -static_cast<ptrdiff_t>(k), &asc, 0, nullptr, nullptr);
-            if (!std::equal(g.end() - std::min(k,n), g.end(), tp.begin())) { std::printf("  unified top FAIL\n"); return false; }
+            if (!std::equal(g.end() - static_cast<std::ptrdiff_t>(std::min(k,n)), g.end(), tp.begin())) { std::printf("  unified top FAIL\n"); return false; }
         }
         // stats path: already-sorted detection + correctness
         std::vector<uint32_t> srt(1000); for (size_t i=0;i<srt.size();++i) srt[i]=static_cast<uint32_t>(i);
@@ -352,11 +352,15 @@ struct Pool { std::vector<uint32_t> flat; int n; int count; };
 
 static Pool make_pool(std::mt19937& rng, int n, long budget, uint32_t hi, bool presorted) {
     int count = (int)std::max(1L, budget / n);
-    Pool p{std::vector<uint32_t>((size_t)count * n), n, count};
+    Pool p{std::vector<uint32_t>(static_cast<size_t>(count) * static_cast<size_t>(n)), n, count};
     std::uniform_int_distribution<uint32_t> d(0, hi);
     for (auto& x : p.flat) x = d(rng);
     if (presorted)
-        for (int i = 0; i < count; ++i) std::sort(p.flat.begin()+ (size_t)i*n, p.flat.begin()+(size_t)(i+1)*n);
+        for (int i = 0; i < count; ++i) {
+            auto lo = static_cast<std::ptrdiff_t>(static_cast<size_t>(i)     * static_cast<size_t>(n));
+            auto hi = static_cast<std::ptrdiff_t>(static_cast<size_t>(i + 1) * static_cast<size_t>(n));
+            std::sort(p.flat.begin() + lo, p.flat.begin() + hi);
+        }
     return p;
 }
 
@@ -367,9 +371,9 @@ static double bench_pool(const Pool& p, F fn, int repeat) {
     for (int r = 0; r < repeat; ++r) {
         work = p.flat;                                   // fresh unsorted copy
         auto t0 = Clock::now();
-        for (int i = 0; i < p.count; ++i) fn(work.data() + (size_t)i * p.n, p.n);
+        for (int i = 0; i < p.count; ++i) fn(work.data() + static_cast<size_t>(i) * static_cast<size_t>(p.n), p.n);
         auto t1 = Clock::now();
-        uint64_t cs = 0; for (int i = 0; i < p.count; ++i) cs += work[(size_t)i * p.n]; g_sink += cs;
+        uint64_t cs = 0; for (int i = 0; i < p.count; ++i) cs += work[static_cast<size_t>(i) * static_cast<size_t>(p.n)]; g_sink += cs;
         double per = std::chrono::duration<double>(t1 - t0).count() / p.count;
         if (per < best) best = per;
     }

@@ -374,17 +374,17 @@ bool heavy_hitter_sort(U* a, size_t n, const U* hh, int m, size_t* aux) {
     size_t cnt[HH_MAX] = {0};
     U v0 = hh[0], v1 = m > 1 ? hh[1] : v0, v2 = m > 2 ? hh[2] : v0, v3 = m > 3 ? hh[3] : v0;
     if (m == 1) {
-        for (size_t i = 0; i < n; ++i) { U x = a[i]; int h0 = (x == v0);
+        for (size_t i = 0; i < n; ++i) { U x = a[i]; size_t h0 = (x == v0);
             cnt[0] += h0; if (!h0) res.push_back(x); }
     } else if (m == 2) {
-        for (size_t i = 0; i < n; ++i) { U x = a[i]; int h0 = (x == v0), h1 = (x == v1);
+        for (size_t i = 0; i < n; ++i) { U x = a[i]; size_t h0 = (x == v0), h1 = (x == v1);
             cnt[0] += h0; cnt[1] += h1; if (!(h0 | h1)) res.push_back(x); }
     } else if (m == 3) {
-        for (size_t i = 0; i < n; ++i) { U x = a[i]; int h0 = (x == v0), h1 = (x == v1), h2 = (x == v2);
+        for (size_t i = 0; i < n; ++i) { U x = a[i]; size_t h0 = (x == v0), h1 = (x == v1), h2 = (x == v2);
             cnt[0] += h0; cnt[1] += h1; cnt[2] += h2; if (!(h0 | h1 | h2)) res.push_back(x); }
     } else {
         for (size_t i = 0; i < n; ++i) { U x = a[i];
-            int h0 = (x == v0), h1 = (x == v1), h2 = (x == v2), h3 = (x == v3);
+            size_t h0 = (x == v0), h1 = (x == v1), h2 = (x == v2), h3 = (x == v3);
             cnt[0] += h0; cnt[1] += h1; cnt[2] += h2; cnt[3] += h3;
             if (!(h0 | h1 | h2 | h3)) res.push_back(x); }
     }
