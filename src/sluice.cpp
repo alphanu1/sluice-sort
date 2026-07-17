@@ -76,11 +76,15 @@ void insertion(U* a, size_t n) {
 // On varied small arrays it beats introsort ~2-4x because it is nearly branch-
 // free where a comparison sort suffers branch mispredictions.
 //
+// mn/mx are the array's min and max, already known to the caller (which scans
+// for them while checking ascending/descending order before ever reaching
+// here) — passing them in saves a second full min/max pass over `a`.
+//
 // Returns true if it sorted the array. Returns false (having touched nothing
-// destructively past a harmless scan) when it detects skew — a bucket larger
-// than INTERP_SKEW — so the caller can hand off to radix. That guard bounds
-// the insertion-repair work to <= INTERP_SKEW * n, defusing the O(n^2) tail
-// that makes interpolation sorts dangerous on adversarial input.
+// destructively) when it detects skew — a bucket larger than INTERP_SKEW — so
+// the caller can hand off to radix. That guard bounds the insertion-repair
+// work to <= INTERP_SKEW * n, defusing the O(n^2) tail that makes
+// interpolation sorts dangerous on adversarial input.
 //
 // Key precision loss for wide U only affects placement; the insertion pass
 // repairs any local disorder, so a successful result is always correct.
@@ -93,10 +97,8 @@ void insertion(U* a, size_t n) {
 // path). The bucket is only an estimate; the insertion repair pass and skew
 // guard keep the result correct regardless of float rounding.
 template <class U>
-bool interp_small(U* a, int n, int skew) {
+bool interp_small(U* a, int n, int skew, U mn, U mx) {
     if (n < 2) return true;
-    U mn = a[0], mx = a[0];
-    for (int i = 1; i < n; ++i) { U x = a[i]; if (x < mn) mn = x; else if (x > mx) mx = x; }
     if (mn == mx) return true;
     const U range = static_cast<U>(mx - mn);         // exact integer diff, >= 1
     const unsigned nm1 = static_cast<unsigned>(n - 1);
@@ -325,29 +327,68 @@ int parallel_radix(U* a, size_t n, int want_threads, size_t* aux_peak = nullptr)
 // --- low-cardinality sort (few distinct values, any value range) --------
 // When an input has only a handful of distinct values spread across a range too
 // wide for counting sort, neither counting (O(range)) nor radix (full byte
-// passes + ~n heap) is ideal. Tallying the distinct set directly is O(n log m)
-// with m tiny and needs no heap. This catches enum/categorical data.
+// passes + ~n heap) is ideal. Tallying the distinct set directly is O(n) with
+// m tiny and needs no heap. This catches enum/categorical data.
 constexpr int LOWCARD_MAX = 16;    // treat <= this many distinct values as low-card
 
-// Sort `a` in place given its `m` distinct values (unsorted) in `vals`
-// (m <= LOWCARD_MAX). Orders the tiny distinct set, tallies each value's count,
-// then emits ascending. Stack-only — no allocation, so it cannot fail.
+// Detect whether `a` has <= LOWCARD_MAX distinct values; if so, sort it in
+// place and return true (false leaves `a` untouched, for the caller to try
+// something else).
+//
+// Detection and tallying are the same single O(n) pass, via a small
+// open-addressed hash table (capacity LOWCARD_PROBE_SLOTS, Fibonacci-hashed,
+// linear probing): each element hashes to a slot, is inserted on first sight,
+// and has that slot's counter bumped every time — both O(1) amortized.
+//
+// This replaces two earlier, separately-broken approaches, in order:
+//   1. A linear scan of the distinct set found so far for each element —
+//      O(n * LOWCARD_MAX). Cheap on high-cardinality input (a new distinct
+//      value shows up almost immediately, so it bails within ~LOWCARD_MAX
+//      elements either way) but ruinous on exactly the input this path
+//      targets: once genuine low-cardinality data fills the seen-set, every
+//      remaining element paid a full scan of it with no early exit — at
+//      n=1e6 that was ~16M compares before any sorting even started, enough
+//      to land slower than std::sort.
+//   2. Fixing just that scan (an O(1) hash probe) while still handing the
+//      found values to a separate tally pass that binary-searched them per
+//      element. That halved the cost but left the bigger piece: a binary
+//      search's compare-and-branch is data-dependent on which of the ~16
+//      values matched, which is effectively random per element, so it
+//      mispredicts on almost every element — measured at ~11ms of a ~15ms
+//      total at n=1e6. Folding tallying into the same hash lookup that
+//      detection already does (below) removes that branchy second pass
+//      entirely, along with the extra full read of `a`.
+constexpr int LOWCARD_PROBE_SLOTS = 32;   // power of two; > LOWCARD_MAX keeps load <= 50%
 template <class U>
-void low_cardinality(U* a, size_t n, U* vals, int m) {
-    insertion(vals, static_cast<size_t>(m));           // order the tiny distinct set
-    size_t cnt[LOWCARD_MAX] = {0};
+bool low_cardinality(U* a, size_t n) {
+    constexpr unsigned mask = LOWCARD_PROBE_SLOTS - 1;
+    U slot[LOWCARD_PROBE_SLOTS];
+    bool used[LOWCARD_PROBE_SLOTS] = {false};
+    size_t cnt[LOWCARD_PROBE_SLOTS] = {0};
+    int m = 0;
     for (size_t i = 0; i < n; ++i) {
         U x = a[i];
-        int lo = 0, hi = m - 1, idx = 0;               // binary search in vals
-        while (lo <= hi) {
-            int mid = (lo + hi) >> 1;
-            if (vals[mid] == x) { idx = mid; break; }
-            if (vals[mid] < x)  lo = mid + 1; else hi = mid - 1;
+        uint64_t h = static_cast<uint64_t>(x) * 0x9E3779B97F4A7C15ull;   // Fibonacci hash
+        unsigned s = static_cast<unsigned>(h >> 59) & mask;              // top 5 bits -> 32 slots
+        while (used[s] && slot[s] != x) s = (s + 1) & mask;
+        if (!used[s]) {
+            if (m >= LOWCARD_MAX) return false;   // a (LOWCARD_MAX+1)th distinct value -> bail
+            used[s] = true; slot[s] = x; ++m;
         }
-        ++cnt[idx];
+        ++cnt[s];
+    }
+    // Gather the m (value, count) pairs found and order them by value — m is
+    // tiny (<= LOWCARD_MAX), so a plain insertion sort of the pairs is cheap.
+    U vals[LOWCARD_MAX]; size_t counts[LOWCARD_MAX]; int k = 0;
+    for (int s = 0; s < LOWCARD_PROBE_SLOTS; ++s) if (used[s]) { vals[k] = slot[s]; counts[k] = cnt[s]; ++k; }
+    for (int x = 1; x < k; ++x) {
+        U v = vals[x]; size_t c = counts[x]; int j = x;
+        while (j > 0 && vals[j - 1] > v) { vals[j] = vals[j - 1]; counts[j] = counts[j - 1]; --j; }
+        vals[j] = v; counts[j] = c;
     }
     size_t o = 0;
-    for (int d = 0; d < m; ++d) { U v = vals[d]; for (size_t c = cnt[d]; c > 0; --c) a[o++] = v; }
+    for (int d = 0; d < k; ++d) { U v = vals[d]; for (size_t c = counts[d]; c > 0; --c) a[o++] = v; }
+    return true;
 }
 
 // --- heavy-hitter path (duplicate-heavy input with many unique outliers) ---
@@ -472,22 +513,20 @@ void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th
     note("insertion", 0, 1, 0);
     if (n < 2) return;
     if (n < th.insertion_max) { insertion(a, n); return; }
-    // small arrays: the interpolation placement sort wins here. If it detects
-    // skew it returns false and we fall through to radix (n is small, so the
-    // radix allocation is tiny).
-    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew)) {
-        // The interp path is stack-only in the default band; a raised interp_max
-        // spills scratch to the heap for n > INTERP_MAX (key_h + cnt_h + out_h).
-        size_t interp_aux = (n > INTERP_MAX)
-            ? n * sizeof(uint16_t) + (n + 1) * sizeof(int) + n * sizeof(U) : 0;
-        note("interpolation", 0, 1, interp_aux); return;
-    }
 
     // one scan: min, max, and run detection in BOTH directions — cheap and
     // high-value. An array already ordered ascending returns in O(n); one
     // ordered descending is finished by a single O(n) reverse instead of a full
     // radix sort (equal integers are indistinguishable, so reversing a
     // non-increasing run yields the correct non-decreasing order).
+    //
+    // This runs BEFORE interpolation (moved ahead of it deliberately) so a
+    // sorted or reverse-sorted array in the interpolation band (n <= interp_max)
+    // exits in a single O(n) pass instead of paying a full placement sort —
+    // previously that band only reached this scan on interpolation's skew
+    // bail-out, so an already-sorted 512-element array cost as much as a random
+    // one. mn/mx come out of this scan and are handed to interp_small below, so
+    // moving it earlier doesn't add a second min/max pass on top.
     //
     // The scan runs in blocks so run-detection never adds a per-element branch to
     // the hot loop (which would mispredict ~50% of the time on random data). Flags
@@ -521,6 +560,17 @@ void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th
     if (ascending)  { note("already sorted", 0, 1, 0); return; }
     if (descending) { std::reverse(a, a + n); note("reverse", 0, 1, 0); return; }
 
+    // small arrays: the interpolation placement sort wins here. If it detects
+    // skew it returns false and we fall through to radix (n is small, so the
+    // radix allocation is tiny).
+    if (n <= th.interp_max && interp_small(a, static_cast<int>(n), th.interp_skew, mn, mx)) {
+        // The interp path is stack-only in the default band; a raised interp_max
+        // spills scratch to the heap for n > INTERP_MAX (key_h + cnt_h + out_h).
+        size_t interp_aux = (n > INTERP_MAX)
+            ? n * sizeof(uint16_t) + (n + 1) * sizeof(int) + n * sizeof(U) : 0;
+        note("interpolation", 0, 1, interp_aux); return;
+    }
+
     const uint64_t range = static_cast<uint64_t>(mx) - static_cast<uint64_t>(mn);
 
     // bounded range -> counting sort (pure O(n), no comparisons). Fastest for
@@ -531,21 +581,12 @@ void sluice_core(U* a, size_t n, core_path* path = nullptr, const Thresholds& th
         catch (const std::bad_alloc&) { /* fall through */ }
     }
 
-    // wide range but few distinct values -> tally the distinct set directly.
-    // Bounded probe: bails the moment a (LOWCARD_MAX+1)th distinct value appears,
-    // so high-cardinality inputs (the radix case) pay only a short prefix scan.
-    {
-        U vals[LOWCARD_MAX]; int m = 0; bool low = true;
-        for (size_t i = 0; i < n; ++i) {
-            U x = a[i]; bool seen = false;
-            for (int d = 0; d < m; ++d) if (vals[d] == x) { seen = true; break; }
-            if (!seen) {
-                if (m < LOWCARD_MAX) vals[m++] = x;
-                else { low = false; break; }
-            }
-        }
-        if (low) { low_cardinality(a, n, vals, m); note("low-cardinality", 0, 1, 0); return; }
-    }
+    // wide range but few distinct values -> detect-and-tally the distinct set
+    // directly in one hashed pass. Bails the moment a (LOWCARD_MAX+1)th
+    // distinct value appears, so high-cardinality inputs (the radix case) pay
+    // only a short prefix scan; stays O(n) even when the input genuinely is
+    // low-cardinality (see low_cardinality).
+    if (low_cardinality(a, n)) { note("low-cardinality", 0, 1, 0); return; }
 
     // duplicate-heavy with outliers -> partition the dominant values out and
     // radix only the small residual. Detection is a cheap sampled probe that
